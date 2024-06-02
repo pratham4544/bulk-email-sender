@@ -1,5 +1,3 @@
-Sure, here's the complete `README.md` file with the full code included:
-
 ```markdown
 # Bulk Email Sender
 
