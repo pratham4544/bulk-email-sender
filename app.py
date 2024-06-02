@@ -30,7 +30,7 @@ def send_bulk_emails(sender, password, subject, body_message, csv_file, attachme
 def main():
     st.title("Bulk Email Sender")
 
-    sender = st.text_input("Sender Email", value='prathameshshete616@gmail.com')
+    sender = st.text_input("Sender Email", value='youremailid@gmail.com')
     password = st.text_input("App Password", type="password")
     subject = st.text_input("Email Subject", value='Test')
     body_message = st.text_area("Email Body", value='This is the text for demo')
