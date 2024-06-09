@@ -3,6 +3,14 @@ import smtplib, ssl, csv
 from email.message import EmailMessage
 import os
 
+st.set_page_config(
+    page_title="Bulk Email Sender",
+    page_icon=":mail:",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+
+
 def send_bulk_emails(sender, password, subject, body_message, csv_file, attachments):
     context = ssl.create_default_context()
     server = smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context)
@@ -26,14 +34,36 @@ def send_bulk_emails(sender, password, subject, body_message, csv_file, attachme
 
     server.close()
     st.write("All messages sent")
+    
+    
+
 
 def main():
     st.title("Bulk Email Sender")
+    
+    
+    linkedin_url = "https://www.linkedin.com/in/prathameshshete/"
 
-    sender = st.text_input("Sender Email", value='youremailid@gmail.com')
-    password = st.text_input("App Password", type="password")
-    subject = st.text_input("Email Subject", value='Test')
-    body_message = st.text_area("Email Body", value='This is the text for demo')
+    header_html = f"""
+        <div style="background-color:#f0f0f0;padding:10px;border-radius:10px;">
+            <h1 style="color:#333;"> </h1>
+            <a href="{linkedin_url}" target="_blank" style="float:right;text-decoration:none;">
+                <button style="padding:5px 10px;background-color:#007bff;color:white;border:none;border-radius:5px;cursor:pointer;">Visit My LinkedIn</button>
+            </a>
+        </div>
+    """
+
+    # Render the header using the HTML component
+    st.markdown(header_html, unsafe_allow_html=True)
+    
+
+    sender = st.text_input("Sender Email")
+    st.warning("don't use you email password it won't work create a app password")
+    if st.button('How to create App Password'):
+        st.switch_page('pages/app_passwords.py')
+    password = st.text_input("App Password")
+    subject = st.text_input("Email Subject")
+    body_message = st.text_area("Email Body")
 
     csv_file = st.file_uploader("Upload CSV file with email addresses", type=["csv"])
     
