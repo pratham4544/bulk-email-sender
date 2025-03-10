@@ -1,4 +1,4 @@
-```markdown
+
 # Bulk Email Sender
 
 This is a Streamlit application for sending bulk emails with attachments using Gmail's SMTP server.
