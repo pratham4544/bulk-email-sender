@@ -1,55 +1,71 @@
-
 # Bulk Email Sender
 
-This is a Streamlit application for sending bulk emails with attachments using Gmail's SMTP server.
+A simple and user-friendly Streamlit application to send bulk emails (with attachments) using Gmail's SMTP server.
+
+---
+
+## Demo
+
+![Bulk Email Sender Screenshot](asset/step1.png)
+
+---
 
 ## Features
 
-- Send bulk emails to multiple recipients from a CSV file.
-- Include a subject and body message for the email.
+- Send emails to multiple recipients from a CSV file.
 - Attach multiple files to each email.
-- User-friendly interface with Streamlit.
+- Simple web interface built with Streamlit.
+- Uses Gmail App Password for secure authentication.
+
+---
 
 ## Prerequisites
 
 - Python 3.7 or higher
-- A Gmail account with "App Password" enabled for SMTP access
+- A Gmail account with [App Password](https://support.google.com/accounts/answer/185833?hl=en) enabled
+- Less secure app access is **not** required (App Password is safer)
+
+---
 
 ## Installation
 
-1. Clone the repository or download the code.
+1. **Clone the repository:**
    ```sh
-   git clone https://github.com/yourusername/bulk-email-sender.git
+   git clone https://github.com/demo-user/bulk-email-sender.git
    cd bulk-email-sender
    ```
 
-2. Install the required Python packages.
+2. **Install dependencies:**
    ```sh
-   pip install streamlit smtplib ssl
+   pip install streamlit
    ```
+
+---
 
 ## Usage
 
-1. Run the Streamlit app.
+1. **Start the Streamlit app:**
    ```sh
-   streamlit run bulk_email_sender_with_attachments.py
+   streamlit run app.py
    ```
 
-2. Open your web browser and navigate to the URL provided by Streamlit, typically `http://localhost:8501`.
+2. **Open the app** in your browser (usually at [http://localhost:8501](http://localhost:8501)).
 
-3. Fill in the required fields:
-   - **Sender Email**: Your Gmail address.
-   - **App Password**: Your Gmail app password (not your regular email password).
-   - **Email Subject**: The subject of your email.
-   - **Email Body**: The body message of your email.
-   - **Upload CSV file with email addresses**: Upload a CSV file containing the email addresses of the recipients.
-   - **Upload attachment(s)**: Optionally, upload files to be attached to each email.
+3. **Fill in the fields:**
+   - **Sender Email:** e.g., `demo.sender@gmail.com`
+   - **App Password:** e.g., `abcd efgh ijkl mnop` (remove spaces when using)
+   - **Email Subject:** e.g., `Welcome to Bulk Email Sender`
+   - **Email Body:** e.g., `Hello, this is a test email sent via Bulk Email Sender.`
+   - **Upload CSV file:** e.g., `email.csv` (see format below)
+   - **Upload attachment(s):** (optional) e.g., `demo.pdf`, `image.png`
 
-4. Click the "Send Emails" button to send the emails to the recipients listed in the CSV file.
+4. **Click "Send Emails"** to send emails to all recipients in the CSV.
+
+---
 
 ## CSV File Format
 
-The CSV file should contain the email addresses of the recipients, one per line. Example:
+The CSV should contain one email address per line, for example:
 
 ```
 recipient1@example.com
@@ -57,36 +73,55 @@ recipient2@example.com
 recipient3@example.com
 ```
 
-
-## Example
-
-Example usage of the app:
-
-1. Enter your sender email and app password.
-2. Enter the email subject and body message.
-3. Upload the CSV file with email addresses.
-4. Optionally, upload one or more files to be attached to each email.
-5. Click "Send Emails" to start the bulk email sending process.
-
-## Security Note
-
-For security reasons, it's recommended to use Gmail's App Passwords feature instead of your main email password. App passwords can be generated in your Google account settings under "Security".
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
+A sample [`email.csv`](email.csv) is included.
 
 ---
 
-Developed by [Your Name](https://github.com/pratham4544)
-```
+## Example
 
-### How to Use the README.md
+Suppose you want to send a welcome email with a PDF attachment to three users:
 
-1. **Save the README**: Save the above text to a file named `README.md` in the root directory of your project.
-2. **Update the Placeholder Information**:
-   - Replace `https://github.com/pratham4544/bulk-email-sender.git` with the actual URL of your repository if you have one.
-   - Replace `[Your Name](https://github.com/pratham4544)` with your actual name and GitHub profile URL.
-3. **Add the README to Your Repository**: If you are using a version control system like Git, add the `README.md` file to your repository and commit the changes.
+- **Sender Email:** `demo.sender@gmail.com`
+- **App Password:** `abcd efgh ijkl mnop`
+- **Subject:** `Welcome!`
+- **Body:** `Hi there, welcome to our service. Please find the attached document.`
+- **CSV:**  
+  ```
+  user1@example.com
+  user2@example.com
+  user3@example.com
+  ```
+- **Attachment:** `welcome.pdf`
 
-This `README.md` file includes all necessary information, such as installation instructions, usage guidelines, and the complete code, making it easy for others to understand and use your project.
+After filling these in and clicking "Send Emails", each user will receive the email with the attachment.
+
+---
+
+## How to Create a Gmail App Password
+
+1. Go to your [Google Account Security page](https://myaccount.google.com/security).
+2. Enable 2-Step Verification.
+3. Under "Signing in to Google", select **App passwords**.
+4. Generate a new app password for "Mail" and "Other (Custom name)".
+5. Copy the 16-character password (remove spaces when entering in the app).
+
+For a detailed guide with screenshots, click the "How to create App Password" button in the app or see [`pages/app_passwords.py`](pages/app_passwords.py).
+
+---
+
+## Security Note
+
+- **Never use your main Gmail password.** Always use an App Password.
+- App Passwords can be revoked at any time from your Google Account.
+
+---
+
+## License
+
+MIT License
+
+---
+
+## Author
+
+Developed by [Demo User](https://github.com/demo-user)

@@ -39,35 +39,62 @@ def send_bulk_emails(sender, password, subject, body_message, csv_file, attachme
 
 
 def main():
-    st.title("Bulk Email Sender")
+    # st.title("Bulk Email Sender")
     
+    # Example values for demonstration
+    demo_sender = "your.email@gmail.com"
+    demo_subject = "Welcome to Bulk Email Sender"
+    demo_body = "Hello, this is a test email sent via Bulk Email Sender."
     
     linkedin_url = "https://www.linkedin.com/in/prathameshshete/"
 
     header_html = f"""
-        <div style="background-color:#f0f0f0;padding:10px;border-radius:10px;">
-            <h1 style="color:#333;"> </h1>
-            <a href="{linkedin_url}" target="_blank" style="float:right;text-decoration:none;">
-                <button style="padding:5px 10px;background-color:#007bff;color:white;border:none;border-radius:5px;cursor:pointer;">Visit My LinkedIn</button>
+        <div style="
+            background: linear-gradient(90deg, #007bff 0%, #00c6ff 100%);
+            padding: 22px 32px;
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 4px 16px rgba(0, 123, 255, 0.08);
+            margin-bottom: 28px;
+        ">
+            <div style="display: flex; align-items: center;">
+                <img src="https://img.icons8.com/color/48/000000/send-mass-email.png" alt="Mail Icon" style="width:42px;height:42px;margin-right:18px;">
+                <span style="font-size:2rem;font-weight:700;color:#fff;letter-spacing:1px;">
+                    Bulk Email Sender
+                </span>
+            </div>
+            <a href="{linkedin_url}" target="_blank" style="text-decoration:none;">
+                <span style="
+                    display: inline-block;
+                    padding: 10px 26px;
+                    background: #fff;
+                    color: #007bff;
+                    font-weight: 600;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 8px rgba(0,123,255,0.10);
+                    transition: background 0.2s, color 0.2s;
+                    border: 2px solid #007bff;
+                " onmouseover="this.style.background='#007bff';this.style.color='#fff';" onmouseout="this.style.background='#fff';this.style.color='#007bff';">
+                    <img src="https://img.icons8.com/color/24/000000/linkedin.png" style="vertical-align:middle;margin-right:8px;">Visit My LinkedIn
+                </span>
             </a>
         </div>
     """
 
-    # Render the header using the HTML component
     st.markdown(header_html, unsafe_allow_html=True)
     
-
-    sender = st.text_input("Sender Email")
-    st.warning("don't use you email password it won't work create a app password")
+    sender = st.text_input("Sender Email", value=demo_sender)
+    st.warning("Don't use your email password. Create an app password.")
     if st.button('How to create App Password'):
         st.switch_page('pages/app_passwords.py')
-    password = st.text_input("App Password")
-    subject = st.text_input("Email Subject")
-    body_message = st.text_area("Email Body")
+    password = st.text_input("App Password", type="password")
+    subject = st.text_input("Email Subject", value=demo_subject)
+    body_message = st.text_area("Email Body", value=demo_body)
 
     csv_file = st.file_uploader("Upload CSV file with email addresses", type=["csv"])
     
-    # Allow multiple file uploads for attachments
     attachments = st.file_uploader("Upload attachment(s)", type=None, accept_multiple_files=True)
 
     if st.button("Send Emails"):
