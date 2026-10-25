@@ -1,0 +1,36 @@
+Dear [Recruiter Name],
+
+I hope you’re doing well.
+
+I’m Prathamesh Shete, an AI/ML Engineer based in Pune with 3+ years of experience building and deploying production-grade AI applications focused on Generative AI, LLMs, RAG, NLP, and voice-based AI systems.
+
+I’m reaching out to explore AI/ML, Generative AI, LLM Engineer, or related opportunities within [Company].
+
+My recent experience includes:
+
+• Developed an AI Voice Calling Agent using Gemini, STT, TTS, Twilio, VoBiz, FastAPI, and Python for real-time conversational calling.
+• Designed and deployed an LLM-based AI Interviewer using LangChain, Redis, Python, and AWS, including Transformer-based question generation and semantic evaluation.
+• Built RAG pipelines using Hugging Face Transformers and developed document retrieval systems using FAISS.
+• Developed NLP/LLM pipelines for analysing social media data, detecting public grievances, and identifying trending civic issues.
+• Built scalable FastAPI microservices and deployed AI workloads on AWS GPU infrastructure.
+• Experience with LangChain, Hugging Face, Gemini, RAG, embeddings, FAISS, Chroma, LlamaIndex, Docker, Redis, AWS, Python, and SQL.
+
+**Current CTC:** 4.8 LPA  
+**Expected CTC:** 7.5 LPA  
+**Notice Period:** 30 Days  
+**Current Location:** Pune
+
+Portfolio: https://prathameshshete.in/  
+GitHub: https://github.com/pratham4544  
+LinkedIn: https://www.linkedin.com/in/prathameshshete
+
+I have attached my updated resume for your consideration. If there are any relevant openings matching my profile, I would be grateful for the opportunity to discuss them.
+
+Thank you for your time.
+
+Best regards,  
+Prathamesh Shete  
+AI/ML Engineer | Generative AI | LLM | Voice AI  
+Pune, Maharashtra  
++91 9970939341  
+prathameshshete609@gmail.com

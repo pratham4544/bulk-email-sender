@@ -1,0 +1,10 @@
+.streamlit/secrets.toml
+__pycache__/
+
+# Personal data - never publish
+all_recruiter_contacts_combined.csv
+template mail.docx
+
+# Editor / AI assistant settings
+.claude/
+.agents/

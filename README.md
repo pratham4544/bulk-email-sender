@@ -12,7 +12,14 @@ A simple and user-friendly Streamlit application to send bulk emails (with attac
 
 ## Features
 
-- Send emails to multiple recipients from a CSV file.
+- Send personalised emails to multiple recipients from a CSV file.
+- Downloadable template CSV for first-time users.
+- Placeholders like `[Recruiter Name]`, `[Company]`, `[Role]` filled per recipient.
+- Blank or messy cells fall back to sensible defaults (e.g. "Dear Hiring Manager").
+- Skip your current company: type its name (or domain) and matching contacts are not emailed.
+- Review/edit the contact table, preview each email, and send a test email to yourself.
+- Schedule sending for a later date and time.
+- Progress bar, delay between emails, and a downloadable send report.
 - Attach multiple files to each email.
 - Simple web interface built with Streamlit.
 - Uses Gmail App Password for secure authentication.
@@ -37,7 +44,7 @@ A simple and user-friendly Streamlit application to send bulk emails (with attac
 
 2. **Install dependencies:**
    ```sh
-   pip install streamlit
+   pip install -r requirements.txt
    ```
 
 ---
@@ -51,29 +58,55 @@ A simple and user-friendly Streamlit application to send bulk emails (with attac
 
 2. **Open the app** in your browser (usually at [http://localhost:8501](http://localhost:8501)).
 
-3. **Fill in the fields:**
-   - **Sender Email:** e.g., `demo.sender@gmail.com`
-   - **App Password:** e.g., `abcd efgh ijkl mnop` (remove spaces when using)
-   - **Email Subject:** e.g., `Welcome to Bulk Email Sender`
-   - **Email Body:** e.g., `Hello, this is a test email sent via Bulk Email Sender.`
-   - **Upload CSV file:** e.g., `email.csv` (see format below)
-   - **Upload attachment(s):** (optional) e.g., `demo.pdf`, `image.png`
+3. **Fill in three things and send:**
+   1. Your **Gmail address** and **App password**.
+   2. Upload your **contacts CSV** and **resume** (optionally type your current company to skip it).
+   3. Check the preview, then click **Send**. Use **Test to myself** first if you like.
 
-4. **Click "Send Emails"** to send emails to all recipients in the CSV.
+   To send later, switch **Send now** to **Schedule**, pick a date and time (in your timezone) and click
+   **Schedule**. You can close the tab; status, cancel and the report appear under step 1. The app must keep
+   running until then (keep the terminal open and the laptop awake when running locally); a restart drops the job.
+
+   Optional sections (collapsed by default): *Review recipients*, *Edit email text*, *Settings* (fallbacks, delay).
+
+4. **Skip typing every time (local only):** copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`
+   and fill in your Gmail, app password and current company. The app pre-fills them. This file is git-ignored.
 
 ---
 
 ## CSV File Format
 
-The CSV should contain one email address per line, for example:
+Click **Template CSV** in the app (or use [`templates/contacts_template.csv`](templates/contacts_template.csv)):
 
 ```
-recipient1@example.com
-recipient2@example.com
-recipient3@example.com
+Email,Contact Person,Company,Role / Job,Subject,Message
+priya.sharma@example.com,Priya Sharma,Example Technologies,AI/ML Engineer,,
+hr@example.org,,Example Labs,Data Scientist,,
+rahul.verma@example.net,Rahul Verma,,GenAI Engineer,Quick question about the [Role] opening,"Hi [First Name], ..."
 ```
 
-A sample [`email.csv`](email.csv) is included.
+- Only **Email** is required; other cells may be blank.
+- **Subject** and **Message** are optional: fill them to write a custom email for that row (placeholders work).
+  Leave them blank to use the default subject/body from the app. For line breaks, press Alt+Enter in Excel /
+  Google Sheets, or type `\n`.
+- Any extra column (e.g. `Phone`) can be used as a `[Phone]` placeholder.
+- A plain list of emails without a header (like [`email.csv`](email.csv)) still works.
+
+### Placeholders and fallbacks
+
+| Placeholder | Column | Used when blank |
+|---|---|---|
+| `[Recruiter Name]` | Contact Person | Hiring Manager |
+| `[First Name]` | Contact Person (first word) | Hiring Manager |
+| `[Company]` | Company | your organization |
+| `[Role]` | Role / Job | AI/ML Engineer roles |
+| `[Email]` | Email | – |
+
+Fallbacks can be changed in the app. Values are also cleaned: emojis and hashtags are removed, ALL-CAPS text is softened,
+a Company equal to the Contact Person is treated as blank, and a name repeated across 3+ different email domains
+is treated as unreliable and replaced with the fallback.
+
+The default email body lives in [`templates/email_template.txt`](templates/email_template.txt).
 
 ---
 
