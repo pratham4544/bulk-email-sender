@@ -16,7 +16,8 @@ def build_message(sender, contact, subject, body, attachments, fallbacks):
     em['Subject'], content = compose(contact, subject, body, fallbacks)
     em.set_content(content)
 
-    for attachment in attachments:
+    # A contact may carry its own list (e.g. other files + a resume tailored to that job).
+    for attachment in contact.get("attachments", attachments):
         em.add_attachment(attachment["content"], maintype=attachment["maintype"], subtype=attachment["subtype"], filename=attachment["filename"])
     return em
 

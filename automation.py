@@ -1,0 +1,360 @@
+"""LinkedIn scraping (Apify), contact writing and resume tailoring (Gemini).
+
+No Streamlit calls here, so it can be tested on its own or run from a background thread.
+"""
+import csv
+import io
+import json
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+
+APIFY_ACTOR = "harvestapi~linkedin-post-search"
+APIFY_BASE = "https://api.apify.com/v2"
+# Current models from aistudio.google.com/docs/models (Nov 2026). The first is the default.
+GEMINI_MODELS = {
+    "gemini-3.5-flash-lite": "Fastest and cheapest",
+    "gemini-4-hydrogen": "Everyday tasks, good balance",
+    "gemini-4-carbon": "Strongest reasoning, best writing, slower and costlier",
+    "gemini-4-neon": "Frontier quality, fast",
+    "gemini-4-argon": "Efficient Gemini 4, lower token spend",
+}
+DEFAULT_GEMINI_MODEL = next(iter(GEMINI_MODELS))
+
+SORT_OPTIONS = {"Most relevant": "relevance", "Newest first": "date"}
+POSTED_OPTIONS = {"Any time": None, "Past 24 hours": "24h", "Past week": "week", "Past month": "month"}
+
+# Columns of the CSV produced by automation. The first six are what contacts.py understands;
+# the rest become extra columns (usable as [LinkedIn Post] etc. in the template).
+CSV_COLUMNS = ["Email", "Contact Person", "Company", "Role / Job", "Subject", "Message",
+               "LinkedIn Post", "Job Description"]
+
+EMAIL_IN_TEXT = re.compile(r"[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+
+
+# ---------------------------------------------------------------- Apify
+
+class ApifyError(RuntimeError):
+    pass
+
+
+def scrape_linkedin_posts(token, keywords, max_posts, sort_by="relevance", posted_limit=None,
+                          on_status=None, poll_every=5, timeout=900):
+    """Run the harvestapi/linkedin-post-search actor and return its post items.
+
+    `keywords` is a list of search queries; `max_posts` applies to each query.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"searchQueries": keywords, "maxPosts": int(max_posts), "sortBy": sort_by,
+               "profileScraperMode": "short", "scrapeReactions": False, "scrapeComments": False}
+    if posted_limit:
+        payload["postedLimit"] = posted_limit
+
+    r = requests.post(f"{APIFY_BASE}/acts/{APIFY_ACTOR}/runs", json=payload, headers=headers, timeout=30)
+    if r.status_code == 401:
+        raise ApifyError("Apify rejected the token. Copy it again from Apify → Settings → API & Integrations.")
+    if not r.ok:
+        raise ApifyError(f"Apify could not start the scraper ({r.status_code}): {r.text[:300]}")
+    run = r.json()["data"]
+
+    started = time.monotonic()
+    while run["status"] in ("READY", "RUNNING"):
+        if time.monotonic() - started > timeout:
+            raise ApifyError("The scraper is taking too long. Try fewer keywords or a lower post limit.")
+        if on_status:
+            on_status(f"Scraping LinkedIn… ({int(time.monotonic() - started)}s)")
+        time.sleep(poll_every)
+        r = requests.get(f"{APIFY_BASE}/actor-runs/{run['id']}", headers=headers, timeout=30)
+        r.raise_for_status()
+        run = r.json()["data"]
+
+    if run["status"] != "SUCCEEDED":
+        raise ApifyError(f"The scraper finished with status {run['status']}. Check the run in your Apify console.")
+
+    r = requests.get(f"{APIFY_BASE}/datasets/{run['defaultDatasetId']}/items",
+                     params={"clean": "true", "format": "json"}, headers=headers, timeout=60)
+    r.raise_for_status()
+    return [item for item in r.json() if item.get("type", "post") == "post" and item.get("content")]
+
+
+def emails_in(text):
+    """Unique emails in a post, in order of appearance (trailing dots from sentences removed)."""
+    seen, found = set(), []
+    for m in EMAIL_IN_TEXT.findall(text or ""):
+        email = m.strip(".").strip()
+        if email.lower() not in seen:
+            seen.add(email.lower())
+            found.append(email)
+    return found
+
+
+def posts_with_emails(posts):
+    """Keep only posts that mention at least one email; attach the emails as `_emails`."""
+    kept = []
+    for post in posts:
+        found = emails_in(post.get("content", ""))
+        if found:
+            kept.append({**post, "_emails": found})
+    return kept
+
+
+# ---------------------------------------------------------------- Gemini
+
+class GeminiError(RuntimeError):
+    pass
+
+
+def _gemini_json(api_key, model, prompt, temperature=0.4, thinking=None):
+    """One JSON-mode Gemini call. `thinking` ("minimal", "low", ...) trades quality for speed."""
+    from google import genai
+    from google.genai import types
+
+    def call(thinking_level):
+        config = types.GenerateContentConfig(response_mime_type="application/json", temperature=temperature)
+        if thinking_level:
+            config.thinking_config = types.ThinkingConfig(thinking_level=thinking_level.upper())
+        return genai.Client(api_key=api_key).models.generate_content(model=model, contents=prompt, config=config)
+
+    try:
+        try:
+            resp = call(thinking)
+        except Exception as e:
+            if not thinking or "thinking" not in str(e).lower():
+                raise
+            resp = call(None)  # model doesn't support that thinking level; use its default
+    except Exception as e:  # SDK raises several error types; show the message to the user
+        msg = str(e)
+        if "API_KEY_INVALID" in msg or "API key not valid" in msg:
+            raise GeminiError("Gemini rejected the API key. Create one at aistudio.google.com/apikey.") from e
+        raise GeminiError(f"Gemini request failed: {msg[:300]}") from e
+    try:
+        return json.loads(resp.text)
+    except (TypeError, json.JSONDecodeError) as e:
+        raise GeminiError("Gemini returned something that was not valid JSON. Try again.") from e
+
+
+CONTACT_PROMPT = """You help a job seeker write short, personalised cold emails to people who posted jobs on LinkedIn.
+
+About the job seeker (their resume / background):
+<background>
+{background}
+</background>
+
+Their usual email, for tone and sign-off (do not copy it word for word):
+<template>
+{template}
+</template>
+
+Extra instructions from the job seeker (follow them if present):
+<note>
+{note}
+</note>
+
+Below are LinkedIn posts. For EVERY email address listed under each post, return one object:
+- "email": exactly the address given
+- "contact_person": the full name of the person to address. Use the post author if the email looks like theirs
+  or the post is theirs; use a different name only if the post says to contact that person. Empty string if unsure.
+- "company": the hiring company named in the post or the author's headline. Empty string if unknown.
+- "role": the job title being hired for, short (e.g. "GenAI Engineer"). Empty string if not a job post.
+- "subject": a specific subject line (max 10 words) that mentions the role.
+- "message": a plain-text email body, 90-150 words. Greet the person by first name (or "Hi there" if unknown),
+  refer to something specific from their post, connect 2-3 concrete points from the background to the role,
+  mention the resume is attached, and end with the sign-off from the template. No markdown, no placeholders
+  in square brackets, no made-up facts about the job seeker.
+
+Return JSON: {{"contacts": [ ... ]}}
+
+Posts:
+{posts}
+"""
+
+
+def _post_block(i, post, max_chars=2500):
+    author = post.get("author") or {}
+    return (f"--- Post {i} ---\n"
+            f"Author: {author.get('name', '')}\nAuthor headline: {author.get('info', '')}\n"
+            f"Emails: {', '.join(post['_emails'])}\n"
+            f"Text:\n{(post.get('content') or '')[:max_chars]}\n")
+
+
+def build_contacts(api_key, model, posts, background, template, note="", batch_size=4, workers=4,
+                   on_status=None):
+    """Turn scraped posts (with `_emails`) into contact rows ready for CSV.
+
+    Batches go to Gemini in parallel; `on_status` is only called from the caller's thread.
+    Returns (rows, errors): rows follow CSV_COLUMNS; errors lists batches that failed.
+    """
+    batches = [posts[i:i + batch_size] for i in range(0, len(posts), batch_size)]
+
+    def write(batch):
+        prompt = CONTACT_PROMPT.format(
+            background=background.strip() or "(not provided)", template=template.strip() or "(not provided)",
+            note=note.strip() or "(none)", posts="\n".join(_post_block(i, p) for i, p in enumerate(batch, 1)))
+        return _gemini_json(api_key, model, prompt, thinking="low")
+
+    results, errors = {}, []
+    if on_status:
+        on_status(f"Writing emails with Gemini… 0 of {len(posts)} posts")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(write, b): i for i, b in enumerate(batches)}
+        done_posts = 0
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                results[i] = fut.result()
+            except GeminiError as e:
+                errors.append(str(e))
+                if "API key" in str(e):
+                    for f in futures:
+                        f.cancel()  # every later batch would fail the same way
+                    break
+            done_posts += len(batches[i])
+            if on_status:
+                on_status(f"Writing emails with Gemini… {done_posts} of {len(posts)} posts")
+
+    rows, seen = [], set()
+    for i, batch in enumerate(batches):  # original order, whatever order the batches finished in
+        if i not in results:
+            continue
+        by_email = {str(c.get("email", "")).strip().lower(): c for c in results[i].get("contacts", [])}
+        for post in batch:
+            for email in post["_emails"]:
+                if email.lower() in seen:
+                    continue
+                seen.add(email.lower())
+                c = by_email.get(email.lower(), {})
+                rows.append({
+                    "Email": email,
+                    "Contact Person": str(c.get("contact_person", "")).strip(),
+                    "Company": str(c.get("company", "")).strip(),
+                    "Role / Job": str(c.get("role", "")).strip(),
+                    "Subject": str(c.get("subject", "")).strip(),
+                    "Message": str(c.get("message", "")).strip(),
+                    "LinkedIn Post": post.get("linkedinUrl", ""),
+                    "Job Description": (post.get("content") or "").strip(),
+                })
+    return rows, errors
+
+
+def rows_to_csv(rows):
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue().encode("utf-8")
+
+
+# ---------------------------------------------------------------- Resume tailoring
+
+def resume_text(filename, data):
+    """Plain text from a PDF, DOCX or TXT resume."""
+    name = filename.lower()
+    if name.endswith(".pdf"):
+        from pypdf import PdfReader
+        return "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(data)).pages).strip()
+    if name.endswith(".docx"):
+        import docx
+        return "\n".join(p.text for p in docx.Document(io.BytesIO(data)).paragraphs).strip()
+    if name.endswith((".txt", ".md")):
+        return data.decode("utf-8", errors="replace").strip()
+    raise ValueError("Resume must be a PDF, DOCX or TXT file.")
+
+
+TAILOR_PROMPT = """You tailor a resume to a job description. Rules:
+- Use ONLY facts in the original resume. Never invent jobs, degrees, dates, numbers, tools or skills.
+- You may reorder sections and bullets, rewrite the summary, and reword bullets so the most relevant
+  experience and the job's keywords (where truthfully supported) come first.
+- Keep it to about one page. Keep the candidate's name and contact details exactly as given.
+
+Return JSON:
+{{"name": "...",
+  "contact": "one line: email | phone | location | links",
+  "sections": [
+    {{"title": "Summary", "paragraph": "..."}},
+    {{"title": "Skills", "bullets": ["Category: item, item", "..."]}},
+    {{"title": "Experience", "items": [
+       {{"heading": "Job title, Company", "meta": "Dates | Location", "bullets": ["...", "..."]}}]}}
+  ]}}
+Each section has a "title" and any of "paragraph", "bullets", "items".
+
+Job description:
+<jd>
+{jd}
+</jd>
+
+Original resume:
+<resume>
+{resume}
+</resume>
+"""
+
+
+def tailor_resume(api_key, model, resume, job_description, extra_note=""):
+    """Ask Gemini for a tailored resume; returns the structured dict described in TAILOR_PROMPT."""
+    prompt = TAILOR_PROMPT.format(jd=job_description[:6000], resume=resume[:12000])
+    if extra_note.strip():
+        prompt += f"\nExtra instructions from the candidate:\n{extra_note.strip()}\n"
+    data = _gemini_json(api_key, model, prompt, temperature=0.3)
+    if not isinstance(data, dict) or not data.get("sections"):
+        raise GeminiError("Gemini returned an empty resume. Try again.")
+    return data
+
+
+_LATIN1_FIXES = str.maketrans({"–": "-", "—": "-", "‘": "'", "’": "'", "“": '"', "”": '"',
+                               "•": "-", "…": "...", " ": " ", "→": "->", "·": "-"})
+
+
+def _pdf_text(text):
+    """The built-in PDF fonts only cover Latin-1, so map common symbols and drop the rest."""
+    return str(text or "").translate(_LATIN1_FIXES).encode("latin-1", errors="ignore").decode("latin-1")
+
+
+def resume_pdf(resume):
+    """Render the tailored resume dict to PDF bytes."""
+    from fpdf import FPDF
+
+    pdf = FPDF(format="A4")
+    pdf.set_margins(15, 12, 15)
+    pdf.set_auto_page_break(True, margin=12)
+    pdf.add_page()
+    width = pdf.w - pdf.l_margin - pdf.r_margin
+
+    def para(text, size=10, style="", gap=0.5, indent=0):
+        pdf.set_font("Helvetica", style, size)
+        pdf.set_x(pdf.l_margin + indent)
+        pdf.multi_cell(width - indent, size * 0.45, _pdf_text(text), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(gap)
+
+    def bullets(items):
+        for b in items or []:
+            para(f"- {b}", indent=3)
+
+    para(resume.get("name", ""), size=18, style="B", gap=1)
+    if resume.get("contact"):
+        para(resume["contact"], size=9, gap=2)
+
+    for section in resume.get("sections", []):
+        pdf.ln(1.5)
+        para(str(section.get("title", "")).upper(), size=11, style="B", gap=0)
+        y = pdf.get_y()
+        pdf.line(pdf.l_margin, y, pdf.l_margin + width, y)
+        pdf.ln(1.5)
+        if section.get("paragraph"):
+            para(section["paragraph"], gap=1)
+        bullets(section.get("bullets"))
+        for item in section.get("items") or []:
+            if item.get("heading"):
+                para(item["heading"], style="B", gap=0)
+            if item.get("meta"):
+                para(item["meta"], size=9, style="I", gap=0.5)
+            bullets(item.get("bullets"))
+            pdf.ln(1)
+    return bytes(pdf.output())
+
+
+def resume_filename(resume, company):
+    name = re.sub(r"[^A-Za-z0-9]+", "_", resume.get("name", "") or "Resume").strip("_")
+    company = re.sub(r"[^A-Za-z0-9]+", "_", company or "").strip("_")
+    return f"{name}_Resume" + (f"_{company}" if company else "") + ".pdf"

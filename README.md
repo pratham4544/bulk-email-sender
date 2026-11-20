@@ -74,6 +74,21 @@ A simple and user-friendly Streamlit application to send bulk emails (with attac
 
 ---
 
+## Automation (optional)
+
+Two switches under the title. Both start **off**, so the app works manually (upload a CSV) by default.
+
+**Find contacts on LinkedIn**: replaces the CSV upload with a search form.
+1. Enter your **Apify API token** and **Gemini API key** in step 1 (or save them as `apify_token` / `gemini_api_key` in `.streamlit/secrets.toml`).
+2. Add search keywords (one search per line), max posts per search, sort order (most relevant / newest) and how recent the posts must be.
+3. Optionally add a note for the AI (e.g. "mention my 30-day notice period").
+4. Press **Find contacts and write emails**. The [harvestapi/linkedin-post-search](https://apify.com/harvestapi/linkedin-post-search) actor scrapes the posts, emails are pulled from the post text, and Gemini writes a personal subject and message for each address using your resume and email template.
+5. The result goes through the same review table as a CSV and can be downloaded. It adds `LinkedIn Post` and `Job Description` columns, so `[LinkedIn Post]` works as a placeholder.
+
+**Tailor resume to each job**: upload a base resume (PDF/DOCX/TXT), press **Tailor resumes**, and Gemini rewrites it for each contact's job description (the LinkedIn post, or the Role column for a manual CSV). It only reorders and rewords what is already in your resume. Each email gets its own tailored PDF; contacts without a job description get the base resume. The PDF uses a simple layout, so check one with **Check tailored resume** before sending.
+
+The Gemini model can be picked under **Settings**: `gemini-3.5-flash-lite` (default, fastest), `gemini-4-hydrogen`, `gemini-4-carbon`, `gemini-4-neon` or `gemini-4-argon`. You can also type another model id. Apify charges per scraped post; check your Apify balance.
+
 ## CSV File Format
 
 Click **Template CSV** in the app (or use [`templates/contacts_template.csv`](templates/contacts_template.csv)):
