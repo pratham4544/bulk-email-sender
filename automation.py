@@ -1,4 +1,4 @@
-"""LinkedIn scraping (Apify), contact writing and resume tailoring (Gemini).
+"""LinkedIn scraping (Apify), contact writing and resume tailoring (Groq or Gemini).
 
 No Streamlit calls here, so it can be tested on its own or run from a background thread.
 """
@@ -22,6 +22,13 @@ GEMINI_MODELS = {
     "gemini-4-argon": "Efficient Gemini 4, lower token spend",
 }
 DEFAULT_GEMINI_MODEL = next(iter(GEMINI_MODELS))
+
+GROQ_MODELS = {
+    "openai/gpt-oss-20b": "Fast and cheap",
+    "openai/gpt-oss-120b": "Stronger writing, a bit slower",
+}
+DEFAULT_GROQ_MODEL = next(iter(GROQ_MODELS))
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 SORT_OPTIONS = {"Most relevant": "relevance", "Newest first": "date"}
 POSTED_OPTIONS = {"Any time": None, "Past 24 hours": "24h", "Past week": "week", "Past month": "month"}
@@ -100,14 +107,46 @@ def posts_with_emails(posts):
     return kept
 
 
-# ---------------------------------------------------------------- Gemini
+# ---------------------------------------------------------------- LLM (Groq or Gemini)
+#
+# `llm` everywhere below is a dict: {"provider": "groq" | "gemini", "api_key": ..., "model": ...}.
 
-class GeminiError(RuntimeError):
+class LLMError(RuntimeError):
     pass
 
 
-def _gemini_json(api_key, model, prompt, temperature=0.4, thinking=None):
-    """One JSON-mode Gemini call. `thinking` ("minimal", "low", ...) trades quality for speed."""
+def _parse_json(text, provider):
+    try:
+        return json.loads(text)
+    except (TypeError, json.JSONDecodeError) as e:
+        raise LLMError(f"{provider} returned something that was not valid JSON. Try again.") from e
+
+
+def _groq_json(api_key, model, prompt, temperature, effort, retries=3):
+    body = {"model": model, "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"}, "temperature": temperature}
+    if effort:
+        body["reasoning_effort"] = effort
+    headers = {"Authorization": f"Bearer {api_key}"}
+    for attempt in range(retries + 1):
+        r = requests.post(GROQ_URL, json=body, headers=headers, timeout=120)
+        if r.status_code == 429 and attempt < retries:  # rate limit; free tier is tight with parallel calls
+            time.sleep(min(float(r.headers.get("retry-after", 2 ** attempt)), 30))
+            continue
+        if r.status_code == 400 and "reasoning_effort" in body and "reasoning" in r.text.lower():
+            body.pop("reasoning_effort")  # model has no reasoning setting
+            continue
+        break
+    if r.status_code == 401:
+        raise LLMError("Groq rejected the API key. Create one at console.groq.com/keys.")
+    if r.status_code == 429:
+        raise LLMError("Groq rate limit reached. Wait a minute or pick a smaller batch of posts.")
+    if not r.ok:
+        raise LLMError(f"Groq request failed ({r.status_code}): {r.text[:300]}")
+    return _parse_json(r.json()["choices"][0]["message"]["content"], "Groq")
+
+
+def _gemini_json(api_key, model, prompt, temperature, thinking):
     from google import genai
     from google.genai import types
 
@@ -127,12 +166,16 @@ def _gemini_json(api_key, model, prompt, temperature=0.4, thinking=None):
     except Exception as e:  # SDK raises several error types; show the message to the user
         msg = str(e)
         if "API_KEY_INVALID" in msg or "API key not valid" in msg:
-            raise GeminiError("Gemini rejected the API key. Create one at aistudio.google.com/apikey.") from e
-        raise GeminiError(f"Gemini request failed: {msg[:300]}") from e
-    try:
-        return json.loads(resp.text)
-    except (TypeError, json.JSONDecodeError) as e:
-        raise GeminiError("Gemini returned something that was not valid JSON. Try again.") from e
+            raise LLMError("Gemini rejected the API key. Create one at aistudio.google.com/apikey.") from e
+        raise LLMError(f"Gemini request failed: {msg[:300]}") from e
+    return _parse_json(resp.text, "Gemini")
+
+
+def llm_json(llm, prompt, temperature=0.4, effort=None):
+    """One JSON-mode call to the chosen provider. `effort` ("low", ...) trades quality for speed."""
+    if llm["provider"] == "groq":
+        return _groq_json(llm["api_key"], llm["model"], prompt, temperature, effort)
+    return _gemini_json(llm["api_key"], llm["model"], prompt, temperature, effort)
 
 
 CONTACT_PROMPT = """You help a job seeker write short, personalised cold emails to people who posted jobs on LinkedIn.
@@ -161,8 +204,10 @@ Below are LinkedIn posts. For EVERY email address listed under each post, return
 - "subject": a specific subject line (max 10 words) that mentions the role.
 - "message": a plain-text email body, 90-150 words. Greet the person by first name (or "Hi there" if unknown),
   refer to something specific from their post, connect 2-3 concrete points from the background to the role,
-  mention the resume is attached, and end with the sign-off from the template. No markdown, no placeholders
-  in square brackets, no made-up facts about the job seeker.
+  mention the resume is attached, and end with the sign-off from the template. Use short paragraphs separated
+  by a blank line, with the sign-off on its own lines. No markdown, no placeholders in square brackets.
+  Every claim about the job seeker (skills, years, achievements, leadership) must appear in the background
+  above. Never invent or exaggerate. If the background is short, write a shorter email.
 
 Return JSON: {{"contacts": [ ... ]}}
 
@@ -179,11 +224,10 @@ def _post_block(i, post, max_chars=2500):
             f"Text:\n{(post.get('content') or '')[:max_chars]}\n")
 
 
-def build_contacts(api_key, model, posts, background, template, note="", batch_size=4, workers=4,
-                   on_status=None):
+def build_contacts(llm, posts, background, template, note="", batch_size=4, workers=4, on_status=None):
     """Turn scraped posts (with `_emails`) into contact rows ready for CSV.
 
-    Batches go to Gemini in parallel; `on_status` is only called from the caller's thread.
+    Batches go to the LLM in parallel; `on_status` is only called from the caller's thread.
     Returns (rows, errors): rows follow CSV_COLUMNS; errors lists batches that failed.
     """
     batches = [posts[i:i + batch_size] for i in range(0, len(posts), batch_size)]
@@ -192,11 +236,11 @@ def build_contacts(api_key, model, posts, background, template, note="", batch_s
         prompt = CONTACT_PROMPT.format(
             background=background.strip() or "(not provided)", template=template.strip() or "(not provided)",
             note=note.strip() or "(none)", posts="\n".join(_post_block(i, p) for i, p in enumerate(batch, 1)))
-        return _gemini_json(api_key, model, prompt, thinking="low")
+        return llm_json(llm, prompt, effort="low")
 
     results, errors = {}, []
     if on_status:
-        on_status(f"Writing emails with Gemini… 0 of {len(posts)} posts")
+        on_status(f"Writing emails with AI… 0 of {len(posts)} posts")
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(write, b): i for i, b in enumerate(batches)}
         done_posts = 0
@@ -204,7 +248,7 @@ def build_contacts(api_key, model, posts, background, template, note="", batch_s
             i = futures[fut]
             try:
                 results[i] = fut.result()
-            except GeminiError as e:
+            except LLMError as e:
                 errors.append(str(e))
                 if "API key" in str(e):
                     for f in futures:
@@ -212,7 +256,7 @@ def build_contacts(api_key, model, posts, background, template, note="", batch_s
                     break
             done_posts += len(batches[i])
             if on_status:
-                on_status(f"Writing emails with Gemini… {done_posts} of {len(posts)} posts")
+                on_status(f"Writing emails with AI… {done_posts} of {len(posts)} posts")
 
     rows, seen = [], set()
     for i, batch in enumerate(batches):  # original order, whatever order the batches finished in
@@ -291,14 +335,14 @@ Original resume:
 """
 
 
-def tailor_resume(api_key, model, resume, job_description, extra_note=""):
-    """Ask Gemini for a tailored resume; returns the structured dict described in TAILOR_PROMPT."""
+def tailor_resume(llm, resume, job_description, extra_note=""):
+    """Ask the LLM for a tailored resume; returns the structured dict described in TAILOR_PROMPT."""
     prompt = TAILOR_PROMPT.format(jd=job_description[:6000], resume=resume[:12000])
     if extra_note.strip():
         prompt += f"\nExtra instructions from the candidate:\n{extra_note.strip()}\n"
-    data = _gemini_json(api_key, model, prompt, temperature=0.3)
+    data = llm_json(llm, prompt, temperature=0.3)
     if not isinstance(data, dict) or not data.get("sections"):
-        raise GeminiError("Gemini returned an empty resume. Try again.")
+        raise LLMError("The AI returned an empty resume. Try again.")
     return data
 
 

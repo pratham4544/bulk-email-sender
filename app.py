@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import os
 import smtplib
 from datetime import datetime, time, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -108,6 +109,28 @@ def saved_secret(name):
         return ""
 
 
+def env_value(name):
+    """A value from the environment or the project's .env file (KEY=value lines)."""
+    if os.environ.get(name):
+        return os.environ[name]
+    env_file = BASE_DIR / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip().removeprefix("export ").strip() == name:
+                return value.strip().strip("'\"")
+    return ""
+
+
+def llm_settings(use_groq, api_key):
+    """The provider/key/model dict automation.py expects; the model comes from the Settings dropdown."""
+    if use_groq:
+        return {"provider": "groq", "name": "Groq", "api_key": api_key,
+                "model": st.session_state.get("groq_model") or auto.DEFAULT_GROQ_MODEL}
+    return {"provider": "gemini", "name": "Gemini", "api_key": api_key,
+            "model": st.session_state.get("gemini_model") or auto.DEFAULT_GEMINI_MODEL}
+
+
 def read_attachments(files):
     attachment_data = []
     for attachment in files or []:
@@ -132,9 +155,8 @@ def background_text(files):
     return ""
 
 
-def find_contacts(apify_token, gemini_key, queries, max_posts, sort_label, posted_label, note,
-                  background_files):
-    """Scrape posts, let Gemini write the emails, and keep the result as a CSV in session state."""
+def find_contacts(apify_token, llm, queries, max_posts, sort_label, posted_label, note, background_files):
+    """Scrape posts, let the LLM write the emails, and keep the result as a CSV in session state."""
     status = st.status("Starting the LinkedIn scraper…", expanded=True)
     try:
         posts = auto.scrape_linkedin_posts(
@@ -146,16 +168,15 @@ def find_contacts(apify_token, gemini_key, queries, max_posts, sort_label, poste
             status.update(label="No posts with an email address. Try other keywords.", state="error")
             return
         rows, errors = auto.build_contacts(
-            gemini_key, st.session_state.get("gemini_model") or auto.DEFAULT_GEMINI_MODEL, with_email,
-            background_text(background_files), st.session_state.get("body_text", TEMPLATE_BODY.read_text()),
+            llm, with_email, background_text(background_files), st.session_state.get("body_text", TEMPLATE_BODY.read_text()),
             note, on_status=lambda m: status.update(label=m))
-    except (auto.ApifyError, auto.GeminiError, OSError) as e:
+    except (auto.ApifyError, auto.LLMError, OSError) as e:
         status.update(label=str(e), state="error")
         return
     for err in errors:
         status.write(f":orange[{err}]")
     if not rows:
-        status.update(label="Gemini could not write any emails.", state="error")
+        status.update(label=f"{llm['name']} could not write any emails.", state="error")
         return
     st.session_state.auto_csv = auto.rows_to_csv(rows)
     st.session_state.auto_run = st.session_state.get("auto_run", 0) + 1
@@ -163,7 +184,7 @@ def find_contacts(apify_token, gemini_key, queries, max_posts, sort_label, poste
                   expanded=False)
 
 
-def linkedin_finder(apify_token, gemini_key, background_files):
+def linkedin_finder(apify_token, llm, background_files):
     """Step 2 in automatic mode: scrape posts, write the emails, keep the CSV in session state."""
     keywords = st.text_area("Search keywords (one search per line)", key="li_keywords", height=90,
                             placeholder='"hiring" AND "GenAI engineer"\nAI ML engineer hiring email')
@@ -173,10 +194,10 @@ def linkedin_finder(apify_token, gemini_key, background_files):
         posted_label = st.selectbox("Posted", list(auto.POSTED_OPTIONS), index=2, key="li_posted")
     note = st.text_area("Note for the AI (optional)", key="li_note", height=70,
                         placeholder="e.g. Mention I can join in 30 days. Keep it under 120 words.",
-                        help="Added to the instructions Gemini uses to write each subject and email.")
+                        help="Added to the instructions the AI uses to write each subject and email.")
 
     queries = [q.strip() for q in keywords.splitlines() if q.strip()]
-    need = [n for n, v in (("Apify token", apify_token), ("Gemini API key", gemini_key)) if not v]
+    need = [n for n, v in (("Apify token", apify_token), (f"{llm['name']} API key", llm["api_key"])) if not v]
     clicked = st.button("Find contacts and write emails", icon=":material/travel_explore:", type="primary",
                         disabled=bool(need or not queries))
     if need:
@@ -185,8 +206,7 @@ def linkedin_finder(apify_token, gemini_key, background_files):
         st.caption("Add at least one search keyword.")
 
     if clicked:
-        find_contacts(apify_token, gemini_key, queries, max_posts, sort_label, posted_label, note,
-                      background_files)
+        find_contacts(apify_token, llm, queries, max_posts, sort_label, posted_label, note, background_files)
 
     if st.session_state.get("auto_csv"):
         st.download_button("Download generated CSV", st.session_state.auto_csv, file_name="linkedin_contacts.csv",
@@ -209,16 +229,15 @@ def tailoring_key(base, contact, note):
     return (base.file_id, job_description(contact), contact["Company"], note.strip())
 
 
-def tailor_resumes(gemini_key, base, base_text, contacts, note):
+def tailor_resumes(llm, base, base_text, contacts, note):
     """Generate a tailored PDF for every contact that has a job description and none cached yet."""
     cache = st.session_state.setdefault("tailored", {})
-    model = st.session_state.get("gemini_model") or auto.DEFAULT_GEMINI_MODEL
     todo = [c for c in contacts if job_description(c) and tailoring_key(base, c, note) not in cache]
     progress = st.progress(0.0, text="Tailoring resumes…")
     failed = []
 
     def one(contact):
-        data = auto.tailor_resume(gemini_key, model, base_text, job_description(contact), note)
+        data = auto.tailor_resume(llm, base_text, job_description(contact), note)
         return contact, auto.resume_filename(data, contact["Company"]), auto.resume_pdf(data)
 
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -241,11 +260,14 @@ def main():
         st.link_button("LinkedIn", LINKEDIN_URL, icon=":material/person:")
     with st.container(horizontal=True):
         automatic = st.toggle("Find contacts on LinkedIn", key="auto_mode",
-                              help="Off: upload your own CSV. On: search LinkedIn posts with Apify and let Gemini "
+                              help="Off: upload your own CSV. On: search LinkedIn posts with Apify and let the AI "
                                    "write a personal subject and email for every address found.")
         tailor = st.toggle("Tailor resume to each job", key="tailor_mode",
-                           help="Gemini rewrites your resume for each job description and attaches that PDF "
+                           help="The AI rewrites your resume for each job description and attaches that PDF "
                                 "instead of your base resume. Uses only facts already in your resume.")
+        use_groq = st.toggle("Use Groq", value=True, key="use_groq",
+                             help=f"On: Groq ({auto.DEFAULT_GROQ_MODEL} by default), fast. Off: Google Gemini. "
+                                  "Used by the two switches on the left; change the model under Settings.")
     st.caption("Fill the boxes, add your contacts and resume, then press **Send**. Everything else has sensible defaults.")
 
     # ---------- 1. Account ----------
@@ -258,14 +280,20 @@ def main():
                                      placeholder="16 characters, spaces are fine").replace(" ", "")
         st.page_link("pages/app_passwords.py", label="Not your normal password. How to get an app password",
                      icon=":material/help:")
-        apify_token = gemini_key = ""
+        apify_token = llm_key = ""
         if automatic or tailor:
             with st.container(horizontal=True):
                 if automatic:
                     apify_token = st.text_input("Apify API token", value=saved_secret("apify_token"),
                                                 type="password", help="Apify console → Settings → API & Integrations.")
-                gemini_key = st.text_input("Gemini API key", value=saved_secret("gemini_api_key"), type="password",
-                                           help="Free key at aistudio.google.com/apikey.")
+                if use_groq:
+                    llm_key = st.text_input("Groq API key", type="password",
+                                            value=env_value("GROQ_API_KEY") or saved_secret("groq_api_key"),
+                                            help="Read from GROQ_API_KEY in .env. Free key at console.groq.com/keys.")
+                else:
+                    llm_key = st.text_input("Gemini API key", value=saved_secret("gemini_api_key"), type="password",
+                                            help="Free key at aistudio.google.com/apikey.")
+        llm = llm_settings(use_groq, llm_key)
 
     scheduled_jobs(sender)
 
@@ -293,7 +321,7 @@ def main():
 
         csv_bytes, csv_key = (csv_file.getvalue(), csv_file.file_id) if csv_file else (None, None)
         if automatic:
-            csv_bytes, csv_key = linkedin_finder(apify_token, gemini_key,
+            csv_bytes, csv_key = linkedin_finder(apify_token, llm,
                                                  [base_resume] + list(attachments or []) if base_resume else attachments)
 
     contacts, extra_cols = [], []
@@ -353,8 +381,10 @@ def main():
         for col in extra_cols:
             fallbacks[col] = st.text_input(col, "")
         if automatic or tailor:
-            st.selectbox("Gemini model", list(auto.GEMINI_MODELS), key="gemini_model", accept_new_options=True,
-                         format_func=lambda m: f"{m}: {auto.GEMINI_MODELS[m]}" if m in auto.GEMINI_MODELS else m,
+            models = auto.GROQ_MODELS if use_groq else auto.GEMINI_MODELS
+            st.selectbox(f"{llm['name']} model", list(models), key="groq_model" if use_groq else "gemini_model",
+                         accept_new_options=True,
+                         format_func=lambda m: f"{m}: {models[m]}" if m in models else m,
                          help="Used for writing emails and tailoring resumes. You can also type any other model id.")
         delay = st.slider("Seconds between emails", 0, 30, 3,
                           help="A small delay lowers the chance of Gmail flagging the batch. "
@@ -383,11 +413,11 @@ def main():
                            "not your original design, so check one before sending.")
                 if base_text and done < len(with_jd):
                     if st.button(f"Tailor {len(with_jd) - done} resumes", icon=":material/auto_fix_high:",
-                                 disabled=not gemini_key):
-                        tailor_resumes(gemini_key, base_resume, base_text, with_jd, tailor_note)
+                                 disabled=not llm["api_key"]):
+                        tailor_resumes(llm, base_resume, base_text, with_jd, tailor_note)
                         st.rerun()
-                    if not gemini_key:
-                        st.caption("Enter your Gemini API key in step 1.")
+                    if not llm["api_key"]:
+                        st.caption(f"Enter your {llm['name']} API key in step 1.")
 
             # Each contact gets the other files plus either its tailored PDF or the base resume.
             if base_resume:
