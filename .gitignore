@@ -5,6 +5,7 @@ __pycache__/
 # Personal data - never publish
 all_recruiter_contacts_combined.csv
 template mail.docx
+backups/
 
 # Editor / AI assistant settings
 .claude/

@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import json
 import os
 import smtplib
 from datetime import datetime, time, timedelta, timezone
@@ -8,6 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import automation as auto
+import browser_store
 from contacts import DEFAULT_FALLBACKS, PLACEHOLDERS, compose, is_excluded_company, parse_contacts
 from mailer import Scheduler, deliver
 
@@ -23,6 +25,7 @@ LINKEDIN_URL = "https://www.linkedin.com/in/prathameshshete/"
 BASE_DIR = Path(__file__).parent
 TEMPLATE_CSV = BASE_DIR / "templates" / "contacts_template.csv"
 TEMPLATE_BODY = BASE_DIR / "templates" / "email_template.txt"
+BACKUP_DIR = BASE_DIR / "backups"  # raw Apify results, one JSON file per search
 FIELDS = ["Email", "Contact Person", "Company", "Role / Job"]
 CUSTOM_FIELDS = ["Subject", "Message"]  # optional per-row overrides
 
@@ -155,6 +158,23 @@ def background_text(files):
     return ""
 
 
+def backup_apify_results(posts, queries, max_posts, sort_label, posted_label):
+    """Keep the scraped posts as JSON in session state (for download) and in backups/ on disk."""
+    now = datetime.now()
+    name = f"apify_linkedin_{now:%Y%m%d_%H%M%S}.json"
+    data = json.dumps({"scraped_at": now.isoformat(timespec="seconds"), "actor": auto.APIFY_ACTOR,
+                       "queries": queries, "max_posts": max_posts, "sort_by": sort_label, "posted": posted_label,
+                       "post_count": len(posts), "posts": posts},
+                      ensure_ascii=False, indent=2, default=str).encode("utf-8")
+    st.session_state.apify_json = (name, data)
+    try:
+        BACKUP_DIR.mkdir(exist_ok=True)
+        (BACKUP_DIR / name).write_bytes(data)
+        return BACKUP_DIR / name
+    except OSError:
+        return None
+
+
 def find_contacts(apify_token, llm, queries, max_posts, sort_label, posted_label, note, background_files):
     """Scrape posts, let the LLM write the emails, and keep the result as a CSV in session state."""
     status = st.status("Starting the LinkedIn scraper…", expanded=True)
@@ -162,6 +182,9 @@ def find_contacts(apify_token, llm, queries, max_posts, sort_label, posted_label
         posts = auto.scrape_linkedin_posts(
             apify_token, queries, max_posts, auto.SORT_OPTIONS[sort_label], auto.POSTED_OPTIONS[posted_label],
             on_status=lambda m: status.update(label=m))
+        saved = backup_apify_results(posts, queries, max_posts, sort_label, posted_label)
+        status.write(f"Backup of the Apify results saved to `{saved.relative_to(BASE_DIR)}`." if saved
+                     else ":orange[Could not write the backup file. Use **Download Apify JSON** below.]")
         with_email = auto.posts_with_emails(posts)
         status.write(f"{len(posts)} posts found, {len(with_email)} contain an email address.")
         if not with_email:
@@ -187,12 +210,13 @@ def find_contacts(apify_token, llm, queries, max_posts, sort_label, posted_label
 def linkedin_finder(apify_token, llm, background_files):
     """Step 2 in automatic mode: scrape posts, write the emails, keep the CSV in session state."""
     keywords = st.text_area("Search keywords (one search per line)", key="li_keywords", height=90,
+                            persist_state="session",
                             placeholder='"hiring" AND "GenAI engineer"\nAI ML engineer hiring email')
     with st.container(horizontal=True):
-        max_posts = st.number_input("Max posts per search", 1, 500, 50, step=10, key="li_max")
-        sort_label = st.selectbox("Sort by", list(auto.SORT_OPTIONS), key="li_sort")
-        posted_label = st.selectbox("Posted", list(auto.POSTED_OPTIONS), index=2, key="li_posted")
-    note = st.text_area("Note for the AI (optional)", key="li_note", height=70,
+        max_posts = st.number_input("Max posts per search", 1, 500, step=10, key="li_max", persist_state="session")
+        sort_label = st.selectbox("Sort by", list(auto.SORT_OPTIONS), key="li_sort", persist_state="session")
+        posted_label = st.selectbox("Posted", list(auto.POSTED_OPTIONS), key="li_posted", persist_state="session")
+    note = st.text_area("Note for the AI (optional)", key="li_note", height=70, persist_state="session",
                         placeholder="e.g. Mention I can join in 30 days. Keep it under 120 words.",
                         help="Added to the instructions the AI uses to write each subject and email.")
 
@@ -208,10 +232,18 @@ def linkedin_finder(apify_token, llm, background_files):
     if clicked:
         find_contacts(apify_token, llm, queries, max_posts, sort_label, posted_label, note, background_files)
 
+    with st.container(horizontal=True):
+        if st.session_state.get("auto_csv"):
+            st.download_button("Download generated CSV", st.session_state.auto_csv, file_name="linkedin_contacts.csv",
+                               mime="text/csv", icon=":material/download:",
+                               help="Edit it in a spreadsheet and switch automation off to upload it manually later.")
+        if st.session_state.get("apify_json"):
+            json_name, json_data = st.session_state.apify_json
+            st.download_button("Download Apify JSON", json_data, file_name=json_name, mime="application/json",
+                               icon=":material/data_object:",
+                               help=f"The raw LinkedIn posts from the last search. A copy is also kept in "
+                                    f"backups/{json_name}.")
     if st.session_state.get("auto_csv"):
-        st.download_button("Download generated CSV", st.session_state.auto_csv, file_name="linkedin_contacts.csv",
-                           mime="text/csv", icon=":material/download:",
-                           help="Edit it in a spreadsheet and switch automation off to upload it manually later.")
         return st.session_state.auto_csv, f"auto_{st.session_state.auto_run}"
     return None, None
 
@@ -254,7 +286,37 @@ def tailor_resumes(llm, base, base_text, contacts, note):
         st.warning(f"{len(failed)} resumes failed: {failed[0]}")
 
 
+# Form values remembered in the browser (see browser_store.py). Secrets are only kept while
+# "Remember my password and API keys" is on.
+SECRET_KEYS = ["password", "apify_token", "groq_api_key", "gemini_api_key"]
+REMEMBERED_KEYS = SECRET_KEYS + [
+    "auto_mode", "tailor_mode", "use_groq", "remember_secrets", "sender", "excluded_company",
+    "subject", "body_text", "fb_contact", "fb_company", "fb_role", "delay", "groq_model", "gemini_model",
+    "tailor_note", "li_keywords", "li_max", "li_sort", "li_posted", "li_note",
+]
+
+
+def init_form_defaults():
+    """Default widget values, set once per session. Values restored from the browser win."""
+    defaults = {
+        "use_groq": True, "remember_secrets": True,
+        "sender": saved_secret("sender_email"), "password": saved_secret("app_password"),
+        "apify_token": saved_secret("apify_token"),
+        "groq_api_key": env_value("GROQ_API_KEY") or saved_secret("groq_api_key"),
+        "gemini_api_key": saved_secret("gemini_api_key"),
+        "excluded_company": saved_secret("current_company"),
+        "subject": "Application for [Role]", "body_text": TEMPLATE_BODY.read_text(encoding="utf-8"),
+        "fb_contact": DEFAULT_FALLBACKS["Contact Person"], "fb_company": DEFAULT_FALLBACKS["Company"],
+        "fb_role": DEFAULT_FALLBACKS["Role / Job"], "delay": 3,
+        "li_max": 50, "li_posted": list(auto.POSTED_OPTIONS)[2],
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
 def main():
+    browser_store.sync(REMEMBERED_KEYS, SECRET_KEYS, "remember_secrets", prefixes=("fb_extra_",))
+    init_form_defaults()
     with st.container(horizontal=True, vertical_alignment="center"):
         st.title(":material/forward_to_inbox: Bulk email sender", width="stretch")
         st.link_button("LinkedIn", LINKEDIN_URL, icon=":material/person:")
@@ -265,7 +327,7 @@ def main():
         tailor = st.toggle("Tailor resume to each job", key="tailor_mode",
                            help="The AI rewrites your resume for each job description and attaches that PDF "
                                 "instead of your base resume. Uses only facts already in your resume.")
-        use_groq = st.toggle("Use Groq", value=True, key="use_groq",
+        use_groq = st.toggle("Use Groq", key="use_groq",
                              help=f"On: Groq ({auto.DEFAULT_GROQ_MODEL} by default), fast. Off: Google Gemini. "
                                   "Used by the two switches on the left; change the model under Settings.")
     st.caption("Fill the boxes, add your contacts and resume, then press **Send**. Everything else has sensible defaults.")
@@ -274,9 +336,8 @@ def main():
     with st.container(border=True):
         st.markdown("**1. Your Gmail account**")
         with st.container(horizontal=True):
-            sender = st.text_input("Gmail address", value=saved_secret("sender_email"),
-                                   placeholder="you@gmail.com")
-            password = st.text_input("App password", value=saved_secret("app_password"), type="password",
+            sender = st.text_input("Gmail address", key="sender", placeholder="you@gmail.com")
+            password = st.text_input("App password", key="password", type="password",
                                      placeholder="16 characters, spaces are fine").replace(" ", "")
         st.page_link("pages/app_passwords.py", label="Not your normal password. How to get an app password",
                      icon=":material/help:")
@@ -284,15 +345,19 @@ def main():
         if automatic or tailor:
             with st.container(horizontal=True):
                 if automatic:
-                    apify_token = st.text_input("Apify API token", value=saved_secret("apify_token"),
+                    apify_token = st.text_input("Apify API token", key="apify_token", persist_state="session",
                                                 type="password", help="Apify console → Settings → API & Integrations.")
                 if use_groq:
-                    llm_key = st.text_input("Groq API key", type="password",
-                                            value=env_value("GROQ_API_KEY") or saved_secret("groq_api_key"),
+                    llm_key = st.text_input("Groq API key", type="password", key="groq_api_key",
+                                            persist_state="session",
                                             help="Read from GROQ_API_KEY in .env. Free key at console.groq.com/keys.")
                 else:
-                    llm_key = st.text_input("Gemini API key", value=saved_secret("gemini_api_key"), type="password",
+                    llm_key = st.text_input("Gemini API key", key="gemini_api_key", persist_state="session",
+                                            type="password",
                                             help="Free key at aistudio.google.com/apikey.")
+        st.toggle("Remember my password and API keys in this browser", key="remember_secrets",
+                  help="Your form is saved in this browser so it is filled in next time. Turn this off on a "
+                       "shared computer: the app password and API keys are then not saved.")
         llm = llm_settings(use_groq, llm_key)
 
     scheduled_jobs(sender)
@@ -313,7 +378,7 @@ def main():
                                                key="base_resume")
         with st.container(horizontal=True, vertical_alignment="bottom"):
             excluded_company = st.text_input(
-                "Skip your current company", value=saved_secret("current_company"), placeholder="e.g. Strelema",
+                "Skip your current company", key="excluded_company", placeholder="e.g. Strelema",
                 help="Contacts whose Company or email domain matches are not emailed. Separate several with commas.")
             st.download_button("Template CSV", data=TEMPLATE_CSV.read_bytes(), file_name="contacts_template.csv",
                                mime="text/csv", icon=":material/download:",
@@ -366,27 +431,26 @@ def main():
     with st.expander("Edit email text", icon=":material/edit:"):
         placeholders = list(PLACEHOLDERS) + [f"[{c}]" for c in extra_cols]
         st.caption("Placeholders: " + "  ".join(f"`{p}`" for p in placeholders))
-        subject = st.text_input("Subject", value="Application for [Role]")
-        body_message = st.text_area("Body", value=TEMPLATE_BODY.read_text(encoding="utf-8"), height=400,
-                                     key="body_text")
+        subject = st.text_input("Subject", key="subject")
+        body_message = st.text_area("Body", height=400, key="body_text")
 
     with st.expander("Settings", icon=":material/tune:"):
         st.markdown("**Used when a cell is blank**")
         fallbacks = {
-            "Contact Person": st.text_input("Contact Person", DEFAULT_FALLBACKS["Contact Person"]),
-            "Company": st.text_input("Company", DEFAULT_FALLBACKS["Company"]),
-            "Role / Job": st.text_input("Role / Job", DEFAULT_FALLBACKS["Role / Job"]),
+            "Contact Person": st.text_input("Contact Person", key="fb_contact"),
+            "Company": st.text_input("Company", key="fb_company"),
+            "Role / Job": st.text_input("Role / Job", key="fb_role"),
         }
         fallbacks["First Name"] = fallbacks["Contact Person"]
         for col in extra_cols:
-            fallbacks[col] = st.text_input(col, "")
+            fallbacks[col] = st.text_input(col, key=f"fb_extra_{col}", persist_state="session")
         if automatic or tailor:
             models = auto.GROQ_MODELS if use_groq else auto.GEMINI_MODELS
             st.selectbox(f"{llm['name']} model", list(models), key="groq_model" if use_groq else "gemini_model",
-                         accept_new_options=True,
+                         accept_new_options=True, persist_state="session",
                          format_func=lambda m: f"{m}: {models[m]}" if m in models else m,
                          help="Used for writing emails and tailoring resumes. You can also type any other model id.")
-        delay = st.slider("Seconds between emails", 0, 30, 3,
+        delay = st.slider("Seconds between emails", 0, 30, key="delay",
                           help="A small delay lowers the chance of Gmail flagging the batch. "
                                "Gmail allows roughly 500 emails/day from a personal account.")
 
@@ -395,7 +459,7 @@ def main():
     if tailor:
         with st.container(border=True):
             st.markdown("**3. Tailored resumes**")
-            tailor_note = st.text_input("Note for the AI (optional)", key="tailor_note",
+            tailor_note = st.text_input("Note for the AI (optional)", key="tailor_note", persist_state="session",
                                         placeholder="e.g. Keep it to one page, put Projects before Experience")
             if not base_resume:
                 st.info("Upload your base resume in step 2.", icon=":material/description:")
