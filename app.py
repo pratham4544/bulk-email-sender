@@ -1,15 +1,17 @@
 import streamlit as st
 import pandas as pd
-import json
-import os
+import hashlib
 import smtplib
 from datetime import datetime, time, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import requests
+
 import automation as auto
-import browser_store
+import profile_ui
+import profiles
 from contacts import DEFAULT_FALLBACKS, PLACEHOLDERS, compose, is_excluded_company, parse_contacts
 from mailer import Scheduler, deliver
 
@@ -25,7 +27,6 @@ LINKEDIN_URL = "https://www.linkedin.com/in/prathameshshete/"
 BASE_DIR = Path(__file__).parent
 TEMPLATE_CSV = BASE_DIR / "templates" / "contacts_template.csv"
 TEMPLATE_BODY = BASE_DIR / "templates" / "email_template.txt"
-BACKUP_DIR = BASE_DIR / "backups"  # raw Apify results, one JSON file per search
 FIELDS = ["Email", "Contact Person", "Company", "Role / Job"]
 CUSTOM_FIELDS = ["Subject", "Message"]  # optional per-row overrides
 
@@ -85,7 +86,8 @@ def scheduled_jobs(sender):
                         get_scheduler().cancel(job["id"])
                         st.rerun()
                 elif job["results"]:
-                    st.download_button("Report", pd.DataFrame(job["results"]).to_csv(index=False).encode(),
+                    st.download_button("Report", pd.DataFrame(job["results"]).drop(columns=["Message-ID"])
+                                       .to_csv(index=False).encode(),
                                        file_name=f"send_report_{job['id']}.csv", mime="text/csv",
                                        key=f"report_{job['id']}", icon=":material/download:")
 
@@ -102,27 +104,6 @@ def to_contacts(edited_df, extra_cols):
         contact["extras"] = {c: str(row.get(c, "")).strip() for c in extra_cols}
         contacts.append(contact)
     return contacts
-
-
-def saved_secret(name):
-    """Read an optional value from .streamlit/secrets.toml without failing when it's absent."""
-    try:
-        return st.secrets.get(name, "")
-    except Exception:
-        return ""
-
-
-def env_value(name):
-    """A value from the environment or the project's .env file (KEY=value lines)."""
-    if os.environ.get(name):
-        return os.environ[name]
-    env_file = BASE_DIR / ".env"
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            key, sep, value = line.partition("=")
-            if sep and key.strip().removeprefix("export ").strip() == name:
-                return value.strip().strip("'\"")
-    return ""
 
 
 def llm_settings(use_groq, api_key):
@@ -158,94 +139,162 @@ def background_text(files):
     return ""
 
 
-def backup_apify_results(posts, queries, max_posts, sort_label, posted_label):
-    """Keep the scraped posts as JSON in session state (for download) and in backups/ on disk."""
-    now = datetime.now()
-    name = f"apify_linkedin_{now:%Y%m%d_%H%M%S}.json"
-    data = json.dumps({"scraped_at": now.isoformat(timespec="seconds"), "actor": auto.APIFY_ACTOR,
-                       "queries": queries, "max_posts": max_posts, "sort_by": sort_label, "posted": posted_label,
-                       "post_count": len(posts), "posts": posts},
-                      ensure_ascii=False, indent=2, default=str).encode("utf-8")
-    st.session_state.apify_json = (name, data)
-    try:
-        BACKUP_DIR.mkdir(exist_ok=True)
-        (BACKUP_DIR / name).write_bytes(data)
-        return BACKUP_DIR / name
-    except OSError:
-        return None
+class SearchStore:
+    """Where LinkedIn searches live: MongoDB for a profile (survives errors, refreshes and restarts),
+    session state for a guest (survives errors, not a closed tab)."""
+
+    def __init__(self, uri, username):
+        self.uri, self.username = uri, username
+
+    def latest(self):
+        if self.username:
+            return profiles.latest_search(self.uri, self.username)
+        return st.session_state.get("guest_search")
+
+    def new(self, params):
+        if self.username:
+            return profiles.new_search(self.uri, self.username, params)
+        st.session_state.guest_search = {
+            "_id": "guest", "params": params, "status": "scraping", "run_id": None, "posts": [], "total_posts": 0,
+            "rows": [], "error": "", "created_at": datetime.now(timezone.utc)}
+        return "guest"
+
+    def update(self, search_id, **fields):
+        if self.username:
+            profiles.update_search(self.uri, search_id, **fields)
+        else:
+            st.session_state.guest_search.update(fields)
+
+    def add_rows(self, search_id, rows):
+        if self.username:
+            profiles.add_search_rows(self.uri, search_id, rows)
+        else:
+            st.session_state.guest_search["rows"] += rows
+
+    def get(self, search_id):
+        return profiles.get_search(self.uri, search_id) if self.username else st.session_state.get("guest_search")
+
+    def archive(self, search_id):
+        if self.username:
+            profiles.update_search(self.uri, search_id, archived=True)
+        else:
+            st.session_state.pop("guest_search", None)
 
 
-def find_contacts(apify_token, llm, queries, max_posts, sort_label, posted_label, note, background_files):
-    """Scrape posts, let the LLM write the emails, and keep the result as a CSV in session state."""
+def run_search(store, search_id, apify_token, llm, background, template, note):
+    """Run (or continue) a search. Each step is saved as soon as it is done: the Apify run id before
+    waiting, the posts once scraped, every batch of emails once written. Nothing paid for is lost."""
+    search = store.get(search_id)
     status = st.status("Starting the LinkedIn scraper…", expanded=True)
     try:
-        posts = auto.scrape_linkedin_posts(
-            apify_token, queries, max_posts, auto.SORT_OPTIONS[sort_label], auto.POSTED_OPTIONS[posted_label],
-            on_status=lambda m: status.update(label=m))
-        saved = backup_apify_results(posts, queries, max_posts, sort_label, posted_label)
-        status.write(f"Backup of the Apify results saved to `{saved.relative_to(BASE_DIR)}`." if saved
-                     else ":orange[Could not write the backup file. Use **Download Apify JSON** below.]")
-        with_email = auto.posts_with_emails(posts)
-        status.write(f"{len(posts)} posts found, {len(with_email)} contain an email address.")
-        if not with_email:
-            status.update(label="No posts with an email address. Try other keywords.", state="error")
-            return
-        rows, errors = auto.build_contacts(
-            llm, with_email, background_text(background_files), st.session_state.get("body_text", TEMPLATE_BODY.read_text()),
-            note, on_status=lambda m: status.update(label=m))
-    except (auto.ApifyError, auto.LLMError, OSError) as e:
-        status.update(label=str(e), state="error")
+        if search["status"] == "scraping":
+            run_id = search["run_id"]
+            if not run_id:
+                p = search["params"]
+                run_id = auto.start_scrape(apify_token, p["queries"], p["max_posts"], auto.SORT_OPTIONS[p["sort"]],
+                                           auto.POSTED_OPTIONS[p["posted"]])
+                store.update(search_id, run_id=run_id)
+            else:
+                status.update(label="Picking up the search that was already running on Apify…")
+            posts = auto.wait_for_scrape(apify_token, run_id, on_status=lambda m: status.update(label=m))
+            with_email = [auto.slim_post(x) for x in auto.posts_with_emails(posts)]
+            store.update(search_id, posts=with_email, total_posts=len(posts), status="writing")
+            status.write(f"{len(posts)} posts found, {len(with_email)} contain an email address.")
+            if not with_email:
+                store.update(search_id, status="done")
+                status.update(label="No posts with an email address. Try other keywords.", state="error")
+                return
+            search = store.get(search_id)
+
+        done = {r["Email"].lower() for r in search["rows"]}
+        todo = [x for x in search["posts"] if not all(e.lower() in done for e in x["_emails"])]
+        _, errors = auto.build_contacts(llm, todo, background, template, note,
+                                        on_status=lambda m: status.update(label=m),
+                                        on_rows=lambda rows: store.add_rows(search_id, rows))
+    except (auto.ApifyError, auto.LLMError, OSError, requests.RequestException) as e:
+        store.update(search_id, error=str(e))
+        status.update(label=f"{e} Nothing is lost: press Continue to pick up where it stopped.", state="error")
         return
+    store.update(search_id, status="done", error="; ".join(errors[:2]))
     for err in errors:
         status.write(f":orange[{err}]")
-    if not rows:
-        status.update(label=f"{llm['name']} could not write any emails.", state="error")
-        return
-    st.session_state.auto_csv = auto.rows_to_csv(rows)
-    st.session_state.auto_run = st.session_state.get("auto_run", 0) + 1
-    status.update(label=f"Ready: {len(rows)} contacts with personalised emails.", state="complete",
-                  expanded=False)
+    status.update(label="Done. Check the contacts below.", state="complete", expanded=bool(errors))
 
 
-def linkedin_finder(apify_token, llm, background_files):
-    """Step 2 in automatic mode: scrape posts, write the emails, keep the CSV in session state."""
+def search_rows(search, template_body):
+    """Rows the AI wrote, plus (once the search is done) rows with your fallback email for the rest."""
+    rows = auto.dedupe(search["rows"])
+    fallback = []
+    if search["status"] == "done":
+        fallback = auto.fallback_rows(search["posts"], template_body, done_emails=[r["Email"] for r in rows])
+    return rows, fallback
+
+
+def linkedin_finder(store, apify_token, llm, background, template_body):
+    """Search LinkedIn posts with Apify, let the AI write each email, keep everything in `store`."""
+    note = st.session_state.get("li_note", "")
+    latest = store.latest()
+    if latest and latest["status"] in ("scraping", "writing"):
+        written, total = len(auto.dedupe(latest["rows"])), sum(len(p["_emails"]) for p in latest["posts"])
+        step = ("while scraping LinkedIn" if latest["status"] == "scraping"
+                else f"after writing {written} of {total} emails")
+        with st.container(border=True):
+            st.markdown(f":material/history: Your last search stopped {step}"
+                        + (f": {latest['error']}" if latest["error"] else "."))
+            st.caption("Nothing is lost. Continue picks up where it stopped without paying Apify again.")
+            with st.container(horizontal=True):
+                if st.button("Continue last search", type="primary", icon=":material/play_arrow:",
+                             disabled=not (apify_token and llm["api_key"])):
+                    run_search(store, latest["_id"], apify_token, llm, background, template_body, note)
+                    st.rerun()
+                if st.button("Discard it", icon=":material/delete:"):
+                    store.archive(latest["_id"])
+                    st.rerun()
+
     keywords = st.text_area("Search keywords (one search per line)", key="li_keywords", height=90,
-                            persist_state="session",
                             placeholder='"hiring" AND "GenAI engineer"\nAI ML engineer hiring email')
     with st.container(horizontal=True):
-        max_posts = st.number_input("Max posts per search", 1, 500, step=10, key="li_max", persist_state="session")
-        sort_label = st.selectbox("Sort by", list(auto.SORT_OPTIONS), key="li_sort", persist_state="session")
-        posted_label = st.selectbox("Posted", list(auto.POSTED_OPTIONS), key="li_posted", persist_state="session")
-    note = st.text_area("Note for the AI (optional)", key="li_note", height=70, persist_state="session",
-                        placeholder="e.g. Mention I can join in 30 days. Keep it under 120 words.",
-                        help="Added to the instructions the AI uses to write each subject and email.")
+        st.number_input("Max posts per search", 1, 500, step=10, key="li_max")
+        st.selectbox("Posted", list(auto.POSTED_OPTIONS), key="li_posted")
+        st.selectbox("Sort by", list(auto.SORT_OPTIONS), key="li_sort")
 
     queries = [q.strip() for q in keywords.splitlines() if q.strip()]
-    need = [n for n, v in (("Apify token", apify_token), (f"{llm['name']} API key", llm["api_key"])) if not v]
-    clicked = st.button("Find contacts and write emails", icon=":material/travel_explore:", type="primary",
-                        disabled=bool(need or not queries))
+    need = [n for n, v in (("Apify key", apify_token), (f"{llm['name']} key", llm["api_key"])) if not v]
+    if st.button("Find contacts and write emails", icon=":material/travel_explore:", type="primary",
+                 disabled=bool(need or not queries)):
+        if latest:
+            store.archive(latest["_id"])
+        search_id = store.new({"queries": queries, "max_posts": st.session_state.li_max,
+                               "sort": st.session_state.li_sort, "posted": st.session_state.li_posted})
+        run_search(store, search_id, apify_token, llm, background, template_body, note)
+        st.rerun()
     if need:
-        st.caption("Enter your " + " and ".join(need) + " in step 1.")
+        st.caption("Missing: " + " and ".join(need) + ". Add your own in Profile setup.")
     elif not queries:
         st.caption("Add at least one search keyword.")
 
-    if clicked:
-        find_contacts(apify_token, llm, queries, max_posts, sort_label, posted_label, note, background_files)
-
-    with st.container(horizontal=True):
-        if st.session_state.get("auto_csv"):
-            st.download_button("Download generated CSV", st.session_state.auto_csv, file_name="linkedin_contacts.csv",
-                               mime="text/csv", icon=":material/download:",
-                               help="Edit it in a spreadsheet and switch automation off to upload it manually later.")
-        if st.session_state.get("apify_json"):
-            json_name, json_data = st.session_state.apify_json
-            st.download_button("Download Apify JSON", json_data, file_name=json_name, mime="application/json",
-                               icon=":material/data_object:",
-                               help=f"The raw LinkedIn posts from the last search. A copy is also kept in "
-                                    f"backups/{json_name}.")
-    if st.session_state.get("auto_csv"):
-        return st.session_state.auto_csv, f"auto_{st.session_state.auto_run}"
-    return None, None
+    if not latest or latest["status"] != "done":
+        return None, None
+    rows, fallback = search_rows(latest, template_body)
+    if not rows and not fallback:
+        return None, None
+    with st.container(horizontal=True, vertical_alignment="center"):
+        when = latest["created_at"].astimezone(user_timezone()).strftime("%d %b, %H:%M")
+        st.caption(f"Contacts from your search on {when}: {len(rows) + len(fallback)} addresses.", width="stretch")
+        st.download_button("CSV", auto.rows_to_csv(rows + fallback), file_name="linkedin_contacts.csv",
+                           mime="text/csv", icon=":material/download:", help="Download the contacts and emails.")
+        if st.button("Clear", icon=":material/close:", help="Hide these contacts. Start a new search above."):
+            store.archive(latest["_id"])
+            st.rerun()
+    if fallback:
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.caption(f":orange[{len(fallback)} contacts use your fallback email (Advanced) because the AI "
+                       f"could not write one.]", width="stretch")
+            if st.button("Retry AI", icon=":material/refresh:", disabled=not llm["api_key"]):
+                store.update(latest["_id"], status="writing")
+                run_search(store, latest["_id"], apify_token, llm, background, template_body, note)
+                st.rerun()
+    return auto.rows_to_csv(rows + fallback), f"search_{latest['_id']}_{len(rows)}_{len(fallback)}"
 
 
 def job_description(contact):
@@ -286,155 +335,85 @@ def tailor_resumes(llm, base, base_text, contacts, note):
         st.warning(f"{len(failed)} resumes failed: {failed[0]}")
 
 
-# Form values remembered in the browser (see browser_store.py). Secrets are only kept while
-# "Remember my password and API keys" is on.
-SECRET_KEYS = ["password", "apify_token", "groq_api_key", "gemini_api_key"]
-REMEMBERED_KEYS = SECRET_KEYS + [
-    "auto_mode", "tailor_mode", "use_groq", "remember_secrets", "sender", "excluded_company",
-    "subject", "body_text", "fb_contact", "fb_company", "fb_role", "delay", "groq_model", "gemini_model",
-    "tailor_note", "li_keywords", "li_max", "li_sort", "li_posted", "li_note",
-]
+class StoredFile:
+    """A resume from the profile, with the same interface as an uploaded file."""
+
+    def __init__(self, d):
+        self.name, self.type, self._content = d["name"], d.get("type") or "application/pdf", d["content"]
+        self.file_id = hashlib.sha1(self._content).hexdigest()
+
+    def getvalue(self):
+        return self._content
 
 
 def init_form_defaults():
-    """Default widget values, set once per session. Values restored from the browser win."""
+    """Default widget values. Values from the signed-in profile win; widgets keep what was typed.
+    The app's own API keys are not put in any box: they're used only when a box is empty."""
     defaults = {
-        "use_groq": True, "remember_secrets": True,
-        "sender": saved_secret("sender_email"), "password": saved_secret("app_password"),
-        "apify_token": saved_secret("apify_token"),
-        "groq_api_key": env_value("GROQ_API_KEY") or saved_secret("groq_api_key"),
-        "gemini_api_key": saved_secret("gemini_api_key"),
-        "excluded_company": saved_secret("current_company"),
+        "use_groq": True, "csv_mode": False,
         "subject": "Application for [Role]", "body_text": TEMPLATE_BODY.read_text(encoding="utf-8"),
         "fb_contact": DEFAULT_FALLBACKS["Contact Person"], "fb_company": DEFAULT_FALLBACKS["Company"],
         "fb_role": DEFAULT_FALLBACKS["Role / Job"], "delay": 3,
-        "li_max": 50, "li_posted": list(auto.POSTED_OPTIONS)[2],
+        "li_max": 50, "li_posted": list(auto.POSTED_OPTIONS)[2], "li_sort": list(auto.SORT_OPTIONS)[0],
+        "li_keywords": "", "li_note": "",
     }
+    defaults.update({k: v for k, v in profile_ui.data().items() if k in profile_ui.PROFILE_KEYS})
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
 
 
+NOTE_HINT = ("Tip: add your portfolio, GitHub or LinkedIn links here, and anything the AI should always mention "
+             "(e.g. notice period). The AI also picks the key highlights from your resume for the subject and body.")
+
+
 def main():
-    browser_store.sync(REMEMBERED_KEYS, SECRET_KEYS, "remember_secrets", prefixes=("fb_extra_",))
     init_form_defaults()
+    profile_ui.autosave()
+    profile_ui.hide_enter_hint()
     with st.container(horizontal=True, vertical_alignment="center"):
         st.title(":material/forward_to_inbox: Bulk email sender", width="stretch")
         st.link_button("LinkedIn", LINKEDIN_URL, icon=":material/person:")
-    with st.container(horizontal=True):
-        automatic = st.toggle("Find contacts on LinkedIn", key="auto_mode",
-                              help="Off: upload your own CSV. On: search LinkedIn posts with Apify and let the AI "
-                                   "write a personal subject and email for every address found.")
+    if st.session_state.pop("_goto_setup", False):  # just registered: the profile page also saves the login
+        st.switch_page("pages/profile.py")
+    profile_ui.restore()
+    profile_ui.gate()
+    profile_ui.panel()
+    username, uri, saved = profile_ui.user(), profile_ui.mongo_uri(), profile_ui.data()
+
+    # Sections in the order they're shown; filled below in the order the logic needs them.
+    details_box = st.container(border=True)
+    jobs_box = st.container()
+    find_box = st.container(border=True)
+    review_box = st.container()
+    tailor_box = st.container()
+    send_box = st.container(border=True)
+    advanced = st.expander("Advanced", icon=":material/tune:")
+
+    # ---------- Advanced (rarely changed) ----------
+    with advanced:
+        csv_mode = st.toggle("Upload my own contacts CSV instead of searching LinkedIn", key="csv_mode")
         tailor = st.toggle("Tailor resume to each job", key="tailor_mode",
                            help="The AI rewrites your resume for each job description and attaches that PDF "
                                 "instead of your base resume. Uses only facts already in your resume.")
-        use_groq = st.toggle("Use Groq", key="use_groq",
-                             help=f"On: Groq ({auto.DEFAULT_GROQ_MODEL} by default), fast. Off: Google Gemini. "
-                                  "Used by the two switches on the left; change the model under Settings.")
-    st.caption("Fill the boxes, add your contacts and resume, then press **Send**. Everything else has sensible defaults.")
-
-    # ---------- 1. Account ----------
-    with st.container(border=True):
-        st.markdown("**1. Your Gmail account**")
-        with st.container(horizontal=True):
-            sender = st.text_input("Gmail address", key="sender", placeholder="you@gmail.com")
-            password = st.text_input("App password", key="password", type="password",
-                                     placeholder="16 characters, spaces are fine").replace(" ", "")
-        st.page_link("pages/app_passwords.py", label="Not your normal password. How to get an app password",
-                     icon=":material/help:")
-        apify_token = llm_key = ""
-        if automatic or tailor:
-            with st.container(horizontal=True):
-                if automatic:
-                    apify_token = st.text_input("Apify API token", key="apify_token", persist_state="session",
-                                                type="password", help="Apify console → Settings → API & Integrations.")
-                if use_groq:
-                    llm_key = st.text_input("Groq API key", type="password", key="groq_api_key",
-                                            persist_state="session",
-                                            help="Read from GROQ_API_KEY in .env. Free key at console.groq.com/keys.")
-                else:
-                    llm_key = st.text_input("Gemini API key", key="gemini_api_key", persist_state="session",
-                                            type="password",
-                                            help="Free key at aistudio.google.com/apikey.")
-        st.toggle("Remember my password and API keys in this browser", key="remember_secrets",
-                  help="Your form is saved in this browser so it is filled in next time. Turn this off on a "
-                       "shared computer: the app password and API keys are then not saved.")
-        llm = llm_settings(use_groq, llm_key)
-
-    scheduled_jobs(sender)
-
-    # ---------- 2. Contacts & resume ----------
-    with st.container(border=True):
-        st.markdown("**2. Contacts and resume**" if not automatic else "**2. Find contacts on LinkedIn**")
-        csv_file = None
-        with st.container(horizontal=True):
-            if not automatic:
-                csv_file = st.file_uploader("Contacts CSV", type=["csv"])
-            attachments = st.file_uploader("Other attachments" if tailor else "Resume / attachments",
-                                           accept_multiple_files=True,
-                                           help="Your base resume goes in step 3 while tailoring is on." if tailor else None)
-            base_resume = None
-            if tailor:
-                base_resume = st.file_uploader("Base resume (PDF, DOCX or TXT)", type=["pdf", "docx", "txt"],
-                                               key="base_resume")
-        with st.container(horizontal=True, vertical_alignment="bottom"):
-            excluded_company = st.text_input(
-                "Skip your current company", key="excluded_company", placeholder="e.g. Strelema",
-                help="Contacts whose Company or email domain matches are not emailed. Separate several with commas.")
-            st.download_button("Template CSV", data=TEMPLATE_CSV.read_bytes(), file_name="contacts_template.csv",
-                               mime="text/csv", icon=":material/download:",
-                               help="Columns: Email (required), Contact Person, Company, Role / Job. Optional: Subject and Message to write a custom email for that row. Blank cells are fine.")
-
-        csv_bytes, csv_key = (csv_file.getvalue(), csv_file.file_id) if csv_file else (None, None)
-        if automatic:
-            csv_bytes, csv_key = linkedin_finder(apify_token, llm,
-                                                 [base_resume] + list(attachments or []) if base_resume else attachments)
-
-    contacts, extra_cols = [], []
-    if csv_bytes:
-        try:
-            parsed, skipped, extra_cols = parse_contacts(csv_bytes)
-        except ValueError as e:
-            st.error(str(e))
-            parsed, skipped = [], []
-
-        if excluded_company.strip():
-            kept = []
-            for c in parsed:
-                if is_excluded_company(c, excluded_company):
-                    skipped.append({"Line": None, "Email": c["Email"], "Reason": "Your current company"})
-                else:
-                    kept.append(c)
-            parsed = kept
-
-        if parsed:
-            with_fallback = sum(bool(c["missing"]) for c in parsed)
-            with st.expander(f"Review recipients: {len(parsed)} to send, {len(skipped)} skipped, "
-                             f"{with_fallback} use a fallback", icon=":material/group:"):
-                st.caption("Edit any cell or untick **Send** to exclude a row. Blank cells use the fallback values.")
-                shown = FIELDS + [f for f in CUSTOM_FIELDS if any(c[f] for c in parsed)]
-                table = pd.DataFrame([
-                    {"Send": True, **{f: c[f] for f in shown}, **c["extras"],
-                     "Blank → fallback": ", ".join(sorted(c["missing"]))}
-                    for c in parsed
-                ])
-                edited = st.data_editor(table, hide_index=True, disabled=["Blank → fallback"],
-                                        column_config={"Message": st.column_config.TextColumn(width="large"),
-                                                       "Job Description": st.column_config.TextColumn(width="large"),
-                                                       "LinkedIn Post": st.column_config.LinkColumn(display_text="Open post")},
-                                        key=f"editor_{csv_key}_{excluded_company}")
-                contacts = to_contacts(edited, extra_cols)
-                if skipped:
-                    st.markdown("**Skipped** (invalid, duplicate, or your current company)")
-                    st.dataframe(pd.DataFrame(skipped), hide_index=True)
-
-    # ---------- Optional: email text & settings ----------
-    with st.expander("Edit email text", icon=":material/edit:"):
-        placeholders = list(PLACEHOLDERS) + [f"[{c}]" for c in extra_cols]
-        st.caption("Placeholders: " + "  ".join(f"`{p}`" for p in placeholders))
+        use_groq = st.toggle("Use Groq for the AI (off: Google Gemini)", key="use_groq")
+        models = auto.GROQ_MODELS if use_groq else auto.GEMINI_MODELS
+        st.selectbox("AI model", list(models), key="groq_model" if use_groq else "gemini_model",
+                     accept_new_options=True, persist_state="session",
+                     format_func=lambda m: f"{m}: {models[m]}" if m in models else m)
+        st.text_area("Note for the AI", key="li_note", height=70, help=NOTE_HINT,
+                     placeholder="e.g. Portfolio: https://... Mention I can join in 30 days.")
+        st.caption(NOTE_HINT)
+        extra_files = st.file_uploader("Extra attachments (sent with every email)", accept_multiple_files=True,
+                                       key="extra_files")
+        excluded_company = st.text_input(
+            "Skip your current company", key="excluded_company", placeholder="e.g. Strelema",
+            help="Contacts whose Company or email domain matches are not emailed. Separate several with commas.")
+        st.divider()
+        st.markdown("**Fallback email**")
+        st.caption("Used for contacts from your CSV and when the AI can't write an email. Placeholders: "
+                   + "  ".join(f"`{p}`" for p in PLACEHOLDERS) + "  `[LinkedIn Post]`")
         subject = st.text_input("Subject", key="subject")
-        body_message = st.text_area("Body", height=400, key="body_text")
-
-    with st.expander("Settings", icon=":material/tune:"):
+        body_message = st.text_area("Body", height=300, key="body_text")
         st.markdown("**Used when a cell is blank**")
         fallbacks = {
             "Contact Person": st.text_input("Contact Person", key="fb_contact"),
@@ -442,76 +421,192 @@ def main():
             "Role / Job": st.text_input("Role / Job", key="fb_role"),
         }
         fallbacks["First Name"] = fallbacks["Contact Person"]
-        for col in extra_cols:
-            fallbacks[col] = st.text_input(col, key=f"fb_extra_{col}", persist_state="session")
-        if automatic or tailor:
-            models = auto.GROQ_MODELS if use_groq else auto.GEMINI_MODELS
-            st.selectbox(f"{llm['name']} model", list(models), key="groq_model" if use_groq else "gemini_model",
-                         accept_new_options=True, persist_state="session",
-                         format_func=lambda m: f"{m}: {models[m]}" if m in models else m,
-                         help="Used for writing emails and tailoring resumes. You can also type any other model id.")
+        extra_fallback_box = st.container()
+        st.divider()
         delay = st.slider("Seconds between emails", 0, 30, key="delay",
                           help="A small delay lowers the chance of Gmail flagging the batch. "
                                "Gmail allows roughly 500 emails/day from a personal account.")
 
-    # ---------- Optional: tailored resumes ----------
-    attachment_data = read_attachments(attachments)
+    # ---------- 1. Who sends ----------
+    with details_box:
+        if username:
+            sender = username
+            password = (saved.get("password") or "").replace(" ", "")
+            stored = profile_ui.resume()
+            resume_file = StoredFile(stored) if stored else None
+            own = {k: saved.get(k, "") for k in ("apify_token", "groq_api_key", "gemini_api_key")}
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.markdown(f":material/mail: Sending from **{sender}**  \n:material/description: Resume: "
+                            + (f"**{resume_file.name}**" if resume_file else ":orange[none yet]"), width="stretch")
+                st.page_link("pages/profile.py", label="Edit profile", icon=":material/edit:")
+            if not password:
+                st.warning("Add your Gmail app password in your profile to send emails.", icon=":material/key:")
+        else:
+            st.markdown("**1. Your details**")
+            sender = st.text_input("Gmail address", key="sender", placeholder="you@gmail.com")
+            password = profile_ui.key_input("App password", "gmail", key="password",
+                                            placeholder="16 characters, spaces are fine").replace(" ", "")
+            resume_file = st.file_uploader("Resume (PDF, DOCX or TXT)", type=["pdf", "docx", "txt"],
+                                           key="guest_resume")
+            with st.expander("Your own API keys (optional)", icon=":material/key:"):
+                st.caption("Leave blank to use the app's shared keys.")
+                own = {
+                    "apify_token": profile_ui.key_input("Apify API token", "apify", key="apify_token"),
+                    "groq_api_key": profile_ui.key_input("Groq API key", "groq", key="groq_api_key"),
+                    "gemini_api_key": profile_ui.key_input("Gemini API key", "gemini", key="gemini_api_key"),
+                }
+        apify_token = own["apify_token"] or profile_ui.default_key("apify")
+        llm = llm_settings(use_groq, (own["groq_api_key"] or profile_ui.default_key("groq")) if use_groq
+                           else (own["gemini_api_key"] or profile_ui.default_key("gemini")))
+
+    with jobs_box:
+        scheduled_jobs(sender)
+
+    # ---------- 2. Contacts ----------
+    with find_box:
+        if csv_mode:
+            st.markdown("**2. Your contacts CSV**")
+            with st.container(horizontal=True, vertical_alignment="bottom"):
+                csv_file = st.file_uploader("Contacts CSV", type=["csv"])
+                st.download_button("Template CSV", data=TEMPLATE_CSV.read_bytes(), file_name="contacts_template.csv",
+                                   mime="text/csv", icon=":material/download:",
+                                   help="Columns: Email (required), Contact Person, Company, Role / Job. Optional: "
+                                        "Subject and Message to write a custom email for that row.")
+            csv_bytes, csv_key = (csv_file.getvalue(), csv_file.file_id) if csv_file else (None, None)
+        else:
+            st.markdown("**2. Find contacts on LinkedIn**")
+            background = background_text([resume_file] + list(extra_files or []) if resume_file else extra_files)
+            csv_bytes, csv_key = linkedin_finder(SearchStore(uri, username), apify_token, llm, background,
+                                                 body_message)
+
+    contacts, extra_cols = [], []
+    if csv_bytes:
+        with review_box:
+            try:
+                parsed, skipped, extra_cols = parse_contacts(csv_bytes)
+            except ValueError as e:
+                st.error(str(e))
+                parsed, skipped = [], []
+
+            if excluded_company.strip():
+                kept = []
+                for c in parsed:
+                    if is_excluded_company(c, excluded_company):
+                        skipped.append({"Line": None, "Email": c["Email"], "Reason": "Your current company"})
+                    else:
+                        kept.append(c)
+                parsed = kept
+
+            if parsed:
+                last = {}
+                if username:
+                    try:
+                        last = profiles.last_sent(uri, username, [c["Email"] for c in parsed])
+                    except Exception as e:
+                        st.warning(f"Could not check your send history, so earlier recipients are not unticked: {e}")
+                tz = user_timezone()
+                last_of = {c["Email"]: last.get(c["Email"].lower()) for c in parsed}
+                fmt = lambda t: t.astimezone(tz).strftime("%d %b %Y") if t else ""
+                recent = [c for c in parsed if profiles.emailed_recently(last_of[c["Email"]])]
+                older = sum(t is not None for t in last_of.values()) - len(recent)
+                resend = False
+                if recent:
+                    # Emailed within the last month: skipped unless the user asks to send again.
+                    with st.container(border=True):
+                        st.markdown(f":material/block: **{len(recent)} of these contacts already got an email from "
+                                    f"you in the last {profiles.RESEND_AFTER_DAYS} days**, so they are skipped.")
+                        st.dataframe(pd.DataFrame([{"Email": c["Email"], "Company": c["Company"],
+                                                    "Last emailed": fmt(last_of[c["Email"]])} for c in recent]),
+                                     hide_index=True, height=min(35 * len(recent) + 38, 220))
+                        resend = st.checkbox("Email them again anyway", key=f"resend_{csv_key}")
+                if older:
+                    st.caption(f":material/history: {older} contacts were emailed more than "
+                               f"{profiles.RESEND_AFTER_DAYS} days ago and are included again.")
+                to_send = len(parsed) - (0 if resend else len(recent))
+                with st.expander(f"Review recipients: {to_send} to send"
+                                 + (f", {len(recent)} already emailed" if recent and not resend else "")
+                                 + (f", {len(skipped)} skipped" if skipped else ""), icon=":material/group:"):
+                    st.caption("Edit any cell or untick **Send** to exclude a row.")
+                    shown = FIELDS + [f for f in CUSTOM_FIELDS if any(c[f] for c in parsed)]
+                    recent_emails = {c["Email"] for c in recent}
+                    table = pd.DataFrame([
+                        {"Send": resend or c["Email"] not in recent_emails, **{f: c[f] for f in shown},
+                         **c["extras"], "Blank → fallback": ", ".join(sorted(c["missing"])),
+                         **({"Last emailed": fmt(last_of[c["Email"]])} if username else {})}
+                        for c in parsed
+                    ])
+                    edited = st.data_editor(table, hide_index=True, disabled=["Blank → fallback", "Last emailed"],
+                                            column_config={"Message": st.column_config.TextColumn(width="large"),
+                                                           "Job Description": st.column_config.TextColumn(width="large"),
+                                                           "LinkedIn Post": st.column_config.LinkColumn(display_text="Open post")},
+                                            key=f"editor_{csv_key}_{excluded_company}_{resend}_"
+                                                f"{st.session_state.get('history_rev', 0)}")
+                    contacts = to_contacts(edited, extra_cols)
+                    if skipped:
+                        st.markdown("**Skipped** (invalid, duplicate, or your current company)")
+                        st.dataframe(pd.DataFrame(skipped), hide_index=True)
+    with extra_fallback_box:
+        for col in extra_cols:
+            fallbacks[col] = st.text_input(col, key=f"fb_extra_{col}", persist_state="session")
+
+    # ---------- Tailored resumes (optional) ----------
+    extra_data = read_attachments(extra_files)
+    attachment_data = read_attachments([resume_file]) + extra_data if resume_file else extra_data
     if tailor:
-        with st.container(border=True):
+        with tailor_box, st.container(border=True):
             st.markdown("**3. Tailored resumes**")
-            tailor_note = st.text_input("Note for the AI (optional)", key="tailor_note", persist_state="session",
+            tailor_note = st.text_input("Note for the AI (optional)", key="tailor_note",
                                         placeholder="e.g. Keep it to one page, put Projects before Experience")
-            if not base_resume:
-                st.info("Upload your base resume in step 2.", icon=":material/description:")
+            if not resume_file:
+                st.info("Add your resume first" + (" in your profile." if username else " above."),
+                        icon=":material/description:")
             elif contacts:
                 try:
-                    base_text = auto.resume_text(base_resume.name, base_resume.getvalue())
+                    base_text = auto.resume_text(resume_file.name, resume_file.getvalue())
                 except Exception as e:
                     st.error(f"Could not read the resume: {e}")
                     base_text = ""
                 cache = st.session_state.get("tailored", {})
                 with_jd = [c for c in contacts if job_description(c)]
-                done = sum(tailoring_key(base_resume, c, tailor_note) in cache for c in with_jd)
+                done = sum(tailoring_key(resume_file, c, tailor_note) in cache for c in with_jd)
                 st.caption(f"{done} of {len(with_jd)} resumes tailored. Contacts without a job description or role "
-                           f"({len(contacts) - len(with_jd)}) get your base resume. The tailored PDF uses a simple layout, "
-                           "not your original design, so check one before sending.")
+                           f"({len(contacts) - len(with_jd)}) get your base resume. The tailored PDF uses a simple "
+                           "layout, not your original design, so check one before sending.")
                 if base_text and done < len(with_jd):
                     if st.button(f"Tailor {len(with_jd) - done} resumes", icon=":material/auto_fix_high:",
                                  disabled=not llm["api_key"]):
-                        tailor_resumes(llm, base_resume, base_text, with_jd, tailor_note)
+                        tailor_resumes(llm, resume_file, base_text, with_jd, tailor_note)
                         st.rerun()
-                    if not llm["api_key"]:
-                        st.caption(f"Enter your {llm['name']} API key in step 1.")
 
-            # Each contact gets the other files plus either its tailored PDF or the base resume.
-            if base_resume:
-                base_file = read_attachments([base_resume])[0]
+            # Each contact gets the extra files plus either its tailored PDF or the base resume.
+            if resume_file:
+                base_file = read_attachments([resume_file])[0]
                 cache = st.session_state.get("tailored", {})
                 for c in contacts:
-                    hit = cache.get(tailoring_key(base_resume, c, tailor_note))
-                    resume_file = ({"filename": hit[0], "content": hit[1], "maintype": "application",
-                                    "subtype": "pdf"} if hit else base_file)
-                    c["attachments"] = attachment_data + [resume_file]
+                    hit = cache.get(tailoring_key(resume_file, c, tailor_note))
+                    resume_att = ({"filename": hit[0], "content": hit[1], "maintype": "application",
+                                   "subtype": "pdf"} if hit else base_file)
+                    c["attachments"] = extra_data + [resume_att]
 
     # ---------- Preview & send ----------
-    with st.container(border=True):
+    with send_box:
         st.markdown(f"**{4 if tailor else 3}. Preview and send**")
         if not contacts:
-            st.info("Find contacts on LinkedIn above to see a preview." if automatic
-                    else "Upload a contacts CSV to see a preview.", icon=":material/upload_file:")
+            st.info("Upload a contacts CSV to see a preview." if csv_mode
+                    else "Find contacts on LinkedIn above to see a preview.", icon=":material/preview:")
             return
 
         pick = st.selectbox("Preview for", range(len(contacts)), label_visibility="collapsed",
                             format_func=lambda i: f"Preview: {contacts[i]['Email']} ({contacts[i]['Contact Person'] or 'no name'})")
         preview_subject, preview_body = compose(contacts[pick], subject, body_message, fallbacks)
-        own = [f.lower() for f in CUSTOM_FIELDS if contacts[pick][f]]
+        own_text = [f.lower() for f in CUSTOM_FIELDS if contacts[pick][f]]
         st.markdown(f"**Subject:** {preview_subject}"
-                    + (f"  :blue-badge[Own {' and '.join(own)} from CSV]" if own else ""))
+                    + ("  :blue-badge[Written for this contact]" if own_text else ""))
         with st.container(height=250):
             st.text(preview_body)
         files = contacts[pick].get("attachments", attachment_data)
         st.caption("Attachments: " + (", ".join(a["filename"] for a in files) if files else "none"))
-        tailored = [a for a in files if base_resume and a["filename"] != base_resume.name
+        tailored = [a for a in files if resume_file and a["filename"] != resume_file.name
                     and a not in attachment_data]
         if tailored:
             st.download_button("Check tailored resume", tailored[0]["content"], file_name=tailored[0]["filename"],
@@ -539,44 +634,52 @@ def main():
             test_clicked = st.button("Test to myself", icon=":material/science:", disabled=bool(missing),
                                      help="Sends the email shown above to your own Gmail.")
         if missing:
-            st.caption("Enter your " + " and ".join(missing) + " in step 1 to send.")
+            st.caption("Add your " + " and ".join(missing) + (" in your profile" if username else " in step 1")
+                       + " to send.")
 
-    if not (test_clicked or send_clicked):
-        return
-
-    if test_clicked:
-        # Uses the previewed contact's details but delivers to the sender.
-        test_contact = {**contacts[pick], "Email": sender,
-                        "Subject": "[TEST] " + preview_subject, "Message": preview_body}
-        results = send_bulk_emails(sender, password, subject, body_message, [test_contact],
-                                   attachment_data, fallbacks, 0)
-        if results and results[0]["Status"] == "Sent":
-            st.success(f"Test email sent to {sender}. Check your inbox.")
-        elif results:
-            st.error(f"Test failed: {results[0]['Error']}")
-        return
-
-    if send_at:
-        if send_at <= datetime.now(timezone.utc):
-            st.error("That time has already passed. Pick a time in the future.")
+        if not (test_clicked or send_clicked):
             return
-        get_scheduler().schedule(send_at.astimezone(timezone.utc), sender, password, subject, body_message,
-                                 contacts, attachment_data, fallbacks, delay)
-        st.success(f"Scheduled {len(contacts)} emails for {send_at:%a %d %b, %H:%M}. "
-                   "You can close this tab; progress shows under step 1.")
-        return
 
-    results = send_bulk_emails(sender, password, subject, body_message, contacts,
-                               attachment_data, fallbacks, delay)
-    if results is None:
-        return
-    sent = sum(r["Status"] == "Sent" for r in results)
-    failed = len(results) - sent
-    (st.success if not failed else st.warning)(f"Done: {sent} sent, {failed} failed.")
-    results_df = pd.DataFrame(results)
-    st.dataframe(results_df, hide_index=True)
-    st.download_button("Download send report", results_df.to_csv(index=False).encode(),
-                       file_name="send_report.csv", mime="text/csv", icon=":material/download:")
+        if test_clicked:
+            # Uses the previewed contact's details but delivers to the sender.
+            test_contact = {**contacts[pick], "Email": sender,
+                            "Subject": "[TEST] " + preview_subject, "Message": preview_body}
+            results = send_bulk_emails(sender, password, subject, body_message, [test_contact],
+                                       attachment_data, fallbacks, 0)
+            if results and results[0]["Status"] == "Sent":
+                st.success(f"Test email sent to {sender}. Check your inbox.")
+            elif results:
+                st.error(f"Test failed: {results[0]['Error']}")
+            return
+
+        if send_at:
+            if send_at <= datetime.now(timezone.utc):
+                st.error("That time has already passed. Pick a time in the future.")
+                return
+            on_done = (lambda results: profiles.record_sends(uri, username, results)) if username else None
+            get_scheduler().schedule(send_at.astimezone(timezone.utc), sender, password, subject, body_message,
+                                     contacts, attachment_data, fallbacks, delay, on_done=on_done)
+            st.success(f"Scheduled {len(contacts)} emails for {send_at:%a %d %b, %H:%M}. "
+                       "You can close this tab; progress shows at the top.")
+            return
+
+        results = send_bulk_emails(sender, password, subject, body_message, contacts,
+                                   attachment_data, fallbacks, delay)
+        if results is None:
+            return
+        if username:
+            try:
+                profiles.record_sends(uri, username, results)
+                st.session_state.history_rev = st.session_state.get("history_rev", 0) + 1
+            except Exception as e:
+                st.warning(f"Emails sent, but the send history was not saved: {e}")
+        sent = sum(r["Status"] == "Sent" for r in results)
+        failed = len(results) - sent
+        (st.success if not failed else st.warning)(f"Done: {sent} sent, {failed} failed.")
+        results_df = pd.DataFrame(results).drop(columns=["Message-ID"])
+        st.dataframe(results_df, hide_index=True)
+        st.download_button("Download send report", results_df.to_csv(index=False).encode(),
+                           file_name="send_report.csv", mime="text/csv", icon=":material/download:")
 
 
 if __name__ == "__main__":

@@ -47,12 +47,9 @@ class ApifyError(RuntimeError):
     pass
 
 
-def scrape_linkedin_posts(token, keywords, max_posts, sort_by="relevance", posted_limit=None,
-                          on_status=None, poll_every=5, timeout=900):
-    """Run the harvestapi/linkedin-post-search actor and return its post items.
-
-    `keywords` is a list of search queries; `max_posts` applies to each query.
-    """
+def start_scrape(token, keywords, max_posts, sort_by="relevance", posted_limit=None):
+    """Start the actor and return its run id. Save the id: the run keeps going on Apify even if this app
+    stops, and its results can be fetched later with wait_for_scrape without paying again."""
     headers = {"Authorization": f"Bearer {token}"}
     payload = {"searchQueries": keywords, "maxPosts": int(max_posts), "sortBy": sort_by,
                "profileScraperMode": "short", "scrapeReactions": False, "scrapeComments": False}
@@ -64,6 +61,16 @@ def scrape_linkedin_posts(token, keywords, max_posts, sort_by="relevance", poste
         raise ApifyError("Apify rejected the token. Copy it again from Apify → Settings → API & Integrations.")
     if not r.ok:
         raise ApifyError(f"Apify could not start the scraper ({r.status_code}): {r.text[:300]}")
+    return r.json()["data"]["id"]
+
+
+def wait_for_scrape(token, run_id, on_status=None, poll_every=5, timeout=900):
+    """Wait for a run (returns at once if it already finished) and return its post items."""
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(f"{APIFY_BASE}/actor-runs/{run_id}", headers=headers, timeout=30)
+    if r.status_code == 404:
+        raise ApifyError("Apify no longer has that search (results are kept for a limited time). Start a new one.")
+    r.raise_for_status()
     run = r.json()["data"]
 
     started = time.monotonic()
@@ -204,7 +211,8 @@ Below are LinkedIn posts. For EVERY email address listed under each post, return
 - "subject": a specific subject line (max 10 words) that mentions the role.
 - "message": a plain-text email body, 90-150 words. Greet the person by first name (or "Hi there" if unknown),
   refer to something specific from their post, connect 2-3 concrete points from the background to the role,
-  mention the resume is attached, and end with the sign-off from the template. Use short paragraphs separated
+  mention the resume is attached, and end with the sign-off from the template. Do not include any URL to the
+  post: a line with the post link is added automatically after the greeting. Use short paragraphs separated
   by a blank line, with the sign-off on its own lines. No markdown, no placeholders in square brackets.
   Every claim about the job seeker (skills, years, achievements, leadership) must appear in the background
   above. Never invent or exaggerate. If the background is short, write a shorter email.
@@ -224,11 +232,14 @@ def _post_block(i, post, max_chars=2500):
             f"Text:\n{(post.get('content') or '')[:max_chars]}\n")
 
 
-def build_contacts(llm, posts, background, template, note="", batch_size=4, workers=4, on_status=None):
+def build_contacts(llm, posts, background, template, note="", batch_size=4, workers=4, on_status=None,
+                   on_rows=None):
     """Turn scraped posts (with `_emails`) into contact rows ready for CSV.
 
-    Batches go to the LLM in parallel; `on_status` is only called from the caller's thread.
-    Returns (rows, errors): rows follow CSV_COLUMNS; errors lists batches that failed.
+    Batches go to the LLM in parallel; `on_status` and `on_rows` are only called from the caller's thread.
+    `on_rows(rows)` gets each batch's rows as soon as it is written, so they can be saved before the rest.
+    Returns (rows, errors): rows follow CSV_COLUMNS; errors lists batches that failed. Posts of failed
+    batches have no rows (see fallback_rows).
     """
     batches = [posts[i:i + batch_size] for i in range(0, len(posts), batch_size)]
 
@@ -248,6 +259,8 @@ def build_contacts(llm, posts, background, template, note="", batch_size=4, work
             i = futures[fut]
             try:
                 results[i] = fut.result()
+                if on_rows:
+                    on_rows(_batch_rows(batches[i], results[i]))
             except LLMError as e:
                 errors.append(str(e))
                 if "API key" in str(e):
@@ -258,28 +271,73 @@ def build_contacts(llm, posts, background, template, note="", batch_size=4, work
             if on_status:
                 on_status(f"Writing emails with AI… {done_posts} of {len(posts)} posts")
 
-    rows, seen = [], set()
-    for i, batch in enumerate(batches):  # original order, whatever order the batches finished in
-        if i not in results:
-            continue
-        by_email = {str(c.get("email", "")).strip().lower(): c for c in results[i].get("contacts", [])}
-        for post in batch:
-            for email in post["_emails"]:
-                if email.lower() in seen:
-                    continue
-                seen.add(email.lower())
-                c = by_email.get(email.lower(), {})
-                rows.append({
-                    "Email": email,
-                    "Contact Person": str(c.get("contact_person", "")).strip(),
-                    "Company": str(c.get("company", "")).strip(),
-                    "Role / Job": str(c.get("role", "")).strip(),
-                    "Subject": str(c.get("subject", "")).strip(),
-                    "Message": str(c.get("message", "")).strip(),
-                    "LinkedIn Post": post.get("linkedinUrl", ""),
-                    "Job Description": (post.get("content") or "").strip(),
-                })
-    return rows, errors
+    rows = []
+    for i in sorted(results):  # original order, whatever order the batches finished in
+        rows += _batch_rows(batches[i], results[i])
+    return dedupe(rows), errors
+
+
+def _batch_rows(batch, result):
+    by_email = {str(c.get("email", "")).strip().lower(): c for c in result.get("contacts", [])}
+    rows = []
+    for post in batch:
+        for email in post["_emails"]:
+            c = by_email.get(email.lower(), {})
+            rows.append({
+                "Email": email,
+                "Contact Person": str(c.get("contact_person", "")).strip(),
+                "Company": str(c.get("company", "")).strip(),
+                "Role / Job": str(c.get("role", "")).strip(),
+                "Subject": str(c.get("subject", "")).strip(),
+                "Message": add_post_reference(str(c.get("message", "")).strip(), post.get("linkedinUrl", "")),
+                "LinkedIn Post": post.get("linkedinUrl", ""),
+                "Job Description": (post.get("content") or "").strip(),
+            })
+    return rows
+
+
+def dedupe(rows):
+    """First row per email address (case-insensitive), order kept."""
+    seen, out = set(), []
+    for r in rows:
+        if r["Email"].lower() not in seen:
+            seen.add(r["Email"].lower())
+            out.append(r)
+    return out
+
+
+def add_post_reference(message, url):
+    """Put a line with the LinkedIn post link after the greeting, so the reader knows which post this is about."""
+    if not message or not url or url in message:
+        return message
+    paragraphs = message.split("\n\n")
+    line = f"I'm writing about your LinkedIn post: {url}"
+    at = 1 if len(paragraphs) > 1 and len(paragraphs[0]) < 60 else 0  # after a short "Hi Priya," line
+    return "\n\n".join(paragraphs[:at] + [line] + paragraphs[at:])
+
+
+def fallback_rows(posts, template_body, done_emails=()):
+    """Rows for posts the AI could not write: blank subject (the default subject is used) and the
+    user's own email text with the post link added."""
+    done = {e.lower() for e in done_emails}
+    rows = []
+    for post in posts:
+        for email in post["_emails"]:
+            if email.lower() not in done:
+                rows.append({"Email": email, "Contact Person": (post.get("author") or {}).get("name", ""),
+                             "Company": "", "Role / Job": "", "Subject": "",
+                             "Message": add_post_reference(template_body, post.get("linkedinUrl", "")),
+                             "LinkedIn Post": post.get("linkedinUrl", ""),
+                             "Job Description": (post.get("content") or "").strip()})
+    return rows
+
+
+def slim_post(post):
+    """Only what the app needs from a scraped post, small enough to store."""
+    author = post.get("author") or {}
+    return {"author": {"name": author.get("name", ""), "info": author.get("info", "")},
+            "content": (post.get("content") or "")[:6000], "linkedinUrl": post.get("linkedinUrl", ""),
+            "_emails": post["_emails"]}
 
 
 def rows_to_csv(rows):

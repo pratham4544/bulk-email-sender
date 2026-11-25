@@ -4,12 +4,6 @@ A simple and user-friendly Streamlit application to send bulk emails (with attac
 
 ---
 
-## Demo
-
-![Bulk Email Sender Screenshot](asset/step1.png)
-
----
-
 ## Features
 
 - Send personalised emails to multiple recipients from a CSV file.
@@ -23,6 +17,9 @@ A simple and user-friendly Streamlit application to send bulk emails (with attac
 - Attach multiple files to each email.
 - Simple web interface built with Streamlit.
 - Uses Gmail App Password for secure authentication.
+- Profiles (MongoDB): log in to save your Gmail address, app password, API keys, subject and body.
+- Send history: addresses you already emailed are unticked automatically; browse history by last/older than 7, 15 or 30 days.
+- Follow-ups page: contacts with no reply after 7/15/30 days, follow-up sent as a reply in the same thread.
 
 ---
 
@@ -69,17 +66,53 @@ A simple and user-friendly Streamlit application to send bulk emails (with attac
 
    Optional sections (collapsed by default): *Review recipients*, *Edit email text*, *Settings* (fallbacks, delay).
 
-4. **Skip typing every time (local only):** copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`
-   and fill in your Gmail, app password and current company. The app pre-fills them. This file is git-ignored.
+4. **Skip typing every time:** register a profile (see below). Your details are filled in on every visit.
 
 ---
 
+## Profiles, history and follow-ups
+
+Put these in `.streamlit/secrets.toml` (or `.env` as `NAME=value` lines) locally, and in Streamlit Cloud →
+Settings → Secrets when deployed (`.env` is not uploaded). See [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example).
+
+| Name | What for |
+|---|---|
+| `MONGODB_URI` | Profiles, send history, saved searches. In Atlas allow `0.0.0.0/0` under *Network Access*. |
+| `APIFY_TOKEN`, `GROQ_API_KEY`, `GEMINI_API_KEY` | The app's shared keys, used when a user hasn't added their own. Never shown to users; usage is billed to you. |
+
+Without `MONGODB_URI` the app runs in guest mode only.
+
+- **Start screen:** *Log in*, *Register* (Gmail, password, resume) or *Continue as guest*. "Keep me logged in"
+  remembers the login in that browser for 30 days. There is **no password reset**: a forgotten password means
+  registering again.
+- **Profile setup** (opens after registering): Gmail app password, resume, LinkedIn search keywords, note for the
+  AI (portfolio links etc.), fallback email, and optionally your own Apify/Groq/Gemini keys. Press **Save**.
+  Everything is filled in on every visit.
+- The login password is stored only as a hash; the profile (keys included) and resume are encrypted with a key
+  made from it, so the database alone doesn't reveal them.
+- **Main page** for a logged-in user: keywords → *Find contacts and write emails* → review → *Send*.
+  CSV upload, resume tailoring, AI model, fallback email text and other settings are under **Advanced**.
+- **Searches are saved step by step.** The Apify run id is saved before waiting, the posts once scraped, and every
+  batch of emails as soon as the AI writes it. If anything fails or the tab closes, *Continue last search* picks
+  up where it stopped without paying Apify again. Contacts the AI couldn't write get your fallback email
+  (*Retry AI* tries again).
+- Each AI-written email gets a line with the LinkedIn post link after the greeting, so the reader knows which post
+  it's about. The subject stays clean.
+- **No repeat emails:** contacts you emailed in the last 30 days are listed above the recipients and skipped;
+  tick *Email them again anyway* to include them. Contacts emailed more than 30 days ago are included again
+  without asking.
+- **History** page: filter by last / older than 7, 15 or 30 days, search, download CSV.
+- **Follow-ups** page: contacts with no reply after 7, 15 or 30 days; send the follow-up as a reply in the same
+  thread, or mark them as replied.
+- Every key field has a button that opens the exact page where that key is created (Google app passwords,
+  Apify integrations, Groq keys, Google AI Studio).
+
 ## Automation (optional)
 
-Three switches under the title. The first two start **off**, so the app works manually (upload a CSV) by default. **Use Groq** (on by default) picks the AI: Groq with `openai/gpt-oss-20b`, or Gemini when switched off. Put your Groq key in a `.env` file as `GROQ_API_KEY=...` (git-ignored) and it is filled in automatically.
+LinkedIn search is the default way to find contacts. Under **Advanced**: switch to your own CSV, turn on resume tailoring, and pick the AI (**Use Groq**, on by default: Groq with `openai/gpt-oss-20b`, or Gemini when off). Keys come from the user's profile, or the app's shared keys (`APIFY_TOKEN`, `GROQ_API_KEY`, `GEMINI_API_KEY`).
 
 **Find contacts on LinkedIn**: replaces the CSV upload with a search form.
-1. Enter your **Apify API token** and your **Groq** (or **Gemini**) API key in step 1 (or save them as `apify_token` / `gemini_api_key` in `.streamlit/secrets.toml`; the Groq key is read from `.env`).
+1. Nothing to enter if the app's shared keys are set. Otherwise add your own Apify and Groq (or Gemini) keys in your profile (guests: under *Your own API keys*).
 2. Add search keywords (one search per line), max posts per search, sort order (most relevant / newest) and how recent the posts must be.
 3. Optionally add a note for the AI (e.g. "mention my 30-day notice period").
 4. Press **Find contacts and write emails**. The [harvestapi/linkedin-post-search](https://apify.com/harvestapi/linkedin-post-search) actor scrapes the posts, emails are pulled from the post text, and the AI writes a personal subject and message for each address using your resume and email template.
@@ -87,7 +120,7 @@ Three switches under the title. The first two start **off**, so the app works ma
 
 **Tailor resume to each job**: upload a base resume (PDF/DOCX/TXT), press **Tailor resumes**, and the AI rewrites it for each contact's job description (the LinkedIn post, or the Role column for a manual CSV). It only reorders and rewords what is already in your resume. Each email gets its own tailored PDF; contacts without a job description get the base resume. The PDF uses a simple layout, so check one with **Check tailored resume** before sending.
 
-The model can be picked under **Settings**. Groq: `openai/gpt-oss-20b` (default) or `openai/gpt-oss-120b`. Gemini: `gemini-3.5-flash-lite` (default, fastest), `gemini-4-hydrogen`, `gemini-4-carbon`, `gemini-4-neon` or `gemini-4-argon`. You can also type another model id. Apify charges per scraped post; check your Apify balance.
+The model can be picked under **Advanced**. Groq: `openai/gpt-oss-20b` (default) or `openai/gpt-oss-120b`. Gemini: `gemini-3.5-flash-lite` (default, fastest), `gemini-4-hydrogen`, `gemini-4-carbon`, `gemini-4-neon` or `gemini-4-argon`. You can also type another model id. Apify charges per scraped post; check your Apify balance.
 
 ## CSV File Format
 
@@ -153,7 +186,7 @@ After filling these in and clicking "Send Emails", each user will receive the em
 4. Generate a new app password for "Mail" and "Other (Custom name)".
 5. Copy the 16-character password (remove spaces when entering in the app).
 
-For a detailed guide with screenshots, click the "How to create App Password" button in the app or see [`pages/app_passwords.py`](pages/app_passwords.py).
+In the app, the **Create app password** button next to the field opens [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) directly.
 
 ---
 
